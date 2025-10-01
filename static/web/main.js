@@ -33,7 +33,7 @@ function setWasmState(state, msg) {
   wasmStatusEl.classList.add(state); // 'ready' | 'loading' | 'error'
 }
 
-// ---------- FX chain (delay + reverb + analyser + master) ----------
+// FX chain (delay + reverb + analyser + master) 
 function createEffectsChain(ctx) {
   const input = ctx.createGain();
   const master = ctx.createGain();
@@ -91,7 +91,7 @@ function makeIR(ctx, dur = 2.0, decay = 2.0) {
   return buf;
 }
 
-// ---------- Start synth (WASM + WebAudio) ----------
+//  Start synth (WASM + WebAudio) 
 export async function startSynth() {
   if (isAudioInitialized) return { audioCtx, analyserNode };
 
@@ -140,7 +140,7 @@ document.addEventListener("click", async function firstTouch() {
   document.removeEventListener("click", firstTouch);
 }, { once: true });
 
-// ---------- UI wiring ----------
+// UI wiring 
 const $  = (s) => document.querySelector(s);
 const $$ = (s) => Array.from(document.querySelectorAll(s));
 
