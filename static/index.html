@@ -1,0 +1,441 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Serum-like Synthesizer with Rust/WASM</title>
+    <style>
+        /* Base styles */
+        * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Helvetica','Arial',sans-serif; }
+        body { background-color: #000; color: #fff; line-height: 1.6; overflow-x: hidden; padding: 20px; }
+        .app { max-width: 1400px; margin: 0 auto; }
+        header { text-align: center; margin-bottom: 30px; padding: 20px; border-bottom: 1px solid #333; }
+        h1 { font-size: 2.5rem; margin-bottom: 10px; font-weight: 300; letter-spacing: 2px; }
+        h2 { font-size: 1.3rem; margin-bottom: 15px; border-bottom: 1px solid #333; padding-bottom: 8px; font-weight: 400; text-transform: uppercase; letter-spacing: 1px; }
+        h3 { font-size: 1.1rem; margin-bottom: 10px; font-weight: 400; color: #ccc; }
+
+        /* Layout */
+        .synth-container { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px,1fr)); gap: 20px; margin-bottom: 30px; }
+        .section { background-color: #111; border-radius: 4px; padding: 15px; border: 1px solid #333; }
+        .oscillators { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px,1fr)); gap: 15px; }
+        .oscillator { background-color: #0a0a0a; border-radius: 4px; padding: 15px; border: 1px solid #222; }
+        .controls-row { display: flex; justify-content: space-around; flex-wrap: wrap; gap: 15px; margin: 15px 0; }
+
+        /* Knobs */
+        .knob { display: flex; flex-direction: column; align-items: center; }
+        .knob-label { margin-top: 8px; font-size: 0.8rem; text-align: center; color: #aaa; text-transform: uppercase; letter-spacing: 1px; }
+        .knob-value { font-size: 0.7rem; color: #fff; margin-top: 4px; background: #222; padding: 2px 6px; border-radius: 3px; }
+        .knob-control { width: 50px; height: 50px; border-radius: 50%; background: linear-gradient(135deg,#333,#000); position: relative; box-shadow: 0 2px 10px rgba(0,0,0,0.5); cursor: grab; border: 1px solid #333; }
+        .knob-control:active { cursor: grabbing; }
+        .knob-indicator { width: 2px; height: 18px; background-color: #fff; position: absolute; top: 5px; left: 50%; transform: translateX(-50%); border-radius: 1px; }
+
+        /* Buttons */
+        .waveform-display { display: flex; justify-content: space-around; margin: 15px 0; flex-wrap: wrap; gap: 5px; }
+        .waveform-button { padding: 5px 10px; background-color: #222; color: #ccc; border: 1px solid #333; border-radius: 3px; cursor: pointer; transition: all 0.2s; font-size: 0.8rem; }
+        .waveform-button.active { background-color: #fff; color: #000; border-color: #666; }
+        .waveform-button:hover { background-color: #333; }
+
+        /* Toggles */
+        .toggle-switch { position: relative; display: inline-block; width: 50px; height: 24px; }
+        .toggle-switch input { opacity: 0; width: 0; height: 0; }
+        .toggle-slider { position: absolute; cursor: pointer; top: 0; left: 0; right: 0; bottom: 0; background-color: #333; transition: .4s; border-radius: 24px; }
+        .toggle-slider:before { position: absolute; content: ""; height: 18px; width: 18px; left: 3px; bottom: 3px; background-color: #fff; transition: .4s; border-radius: 50%; }
+        input:checked + .toggle-slider { background-color: #666; }
+        input:checked + .toggle-slider:before { transform: translateX(26px); }
+
+        /* Mod matrix */
+        .modulation-matrix { overflow-x: auto; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 8px; text-align: center; border: 1px solid #333; font-size: 0.8rem; }
+        th { background-color: #0a0a0a; color: #fff; font-weight: 400; }
+        input[type="range"] { width: 80px; background: #222; border: 1px solid #333; -webkit-appearance: none; height: 5px; border-radius: 5px; }
+        input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none; width: 15px; height: 15px; border-radius: 50%; background: #aaa; cursor: pointer; }
+
+        /* Keyboard */
+        .keyboard { display: flex; height: 120px; margin-top: 30px; position: relative; }
+        .key { position: relative; border: 1px solid #333; border-radius: 0 0 3px 3px; cursor: pointer; user-select: none; }
+        .key.white { background-color: #fff; width: 14.2857%; height: 100%; z-index: 1; }
+        .key.black { background-color: #000; width: 10%; height: 65%; margin-left: -5%; margin-right: -5%; z-index: 2; border: 1px solid #333; }
+        .key.active { background-color: #666; }
+        .key.white.active { background-color: #aaa; }
+        .key-label { position: absolute; bottom: 10px; width: 100%; text-align: center; font-size: 0.7rem; color: #333; }
+        .key.black .key-label { color: #aaa; }
+
+        /* Wavetable editor */
+        .wavetable-editor { margin: 20px 0; }
+        .wavetable-canvas { width: 100%; height: 150px; background-color: #000; border-radius: 4px; border: 1px solid #333; }
+
+        /* Spectrum analyzer */
+        .spectrum-analyzer { margin: 20px 0; }
+        .spectrum-canvas { width: 100%; height: 150px; background-color: #000; border-radius: 4px; border: 1px solid #333; }
+
+        /* Buttons */
+        button { padding: 8px 12px; background-color: #222; color: #fff; border: 1px solid #333; border-radius: 3px; cursor: pointer; transition: background-color 0.2s; font-size: 0.9rem; }
+        button:hover { background-color: #333; }
+        button:disabled { background-color: #111; color: #666; cursor: not-allowed; }
+
+        /* Presets */
+        .preset-manager { display: flex; gap: 10px; margin: 15px 0; }
+        select, input { padding: 8px; background-color: #222; color: #fff; border: 1px solid #333; border-radius: 3px; }
+
+        /* Toggle container */
+        .toggle-container { display: flex; align-items: center; gap: 10px; margin: 10px 0; }
+        .toggle-label { font-size: 0.9rem; color: #ccc; }
+
+        /* Status */
+        .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; background-color: #333; margin-right: 8px; }
+        .status-indicator.active { background-color: #64ffda; box-shadow: 0 0 8px #64ffda; }
+        .status-container { display: flex; align-items: center; margin: 15px 0; font-size: 0.9rem; }
+        .wasm-status { margin-top: 10px; padding: 8px; background-color: #1a1a1a; border-radius: 4px; border: 1px solid #333; font-size: 0.9rem; }
+        .wasm-status.ready { border-color: #64ffda; color: #64ffda; }
+        .wasm-status.loading { border-color: #ffb74d; color: #ffb74d; }
+        .wasm-status.error { border-color: #ff5252; color: #ff5252; }
+
+        /* Responsive */
+        @media (max-width: 768px) {
+            .synth-container { grid-template-columns: 1fr; }
+            .controls-row { justify-content: center; }
+            .keyboard { height: 100px; }
+        }
+    </style>
+</head>
+<body>
+    <div class="app">
+        <header>
+            <h1>Serum-like Synthesizer</h1>
+            <p>Advanced wavetable synthesizer built with Rust & WebAssembly</p>
+            <div class="status-container">
+                <span class="status-indicator" id="audio-status"></span>
+                <span id="status-text">Initializing audio engine...</span>
+            </div>
+            <div class="wasm-status" id="wasm-status">WebAssembly: Not loaded</div>
+        </header>
+        
+        <div class="synth-container">
+            <!-- Oscillators Section -->
+            <div class="section oscillators-section">
+                <h2>Oscillators</h2>
+                <div class="oscillators">
+                    <div class="oscillator">
+                        <h3>Oscillator 1</h3>
+                        <div class="waveform-display">
+                            <button class="waveform-button active" data-osc="0" data-waveform="sine">Sine</button>
+                            <button class="waveform-button" data-osc="0" data-waveform="saw">Saw</button>
+                            <button class="waveform-button" data-osc="0" data-waveform="square">Square</button>
+                            <button class="waveform-button" data-osc="0" data-waveform="triangle">Triangle</button>
+                            <button class="waveform-button" data-osc="0" data-waveform="noise">Noise</button>
+                        </div>
+                        <div class="controls-row">
+                            <div class="knob">
+                                <div class="knob-control" data-param="detune" data-osc="0"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Detune</div>
+                                <div class="knob-value" id="osc1-detune-value">0.0</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="unison" data-osc="0"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Unison</div>
+                                <div class="knob-value">1</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="volume" data-osc="0"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Volume</div>
+                                <div class="knob-value">0.8</div>
+                            </div>
+                        </div>
+                        <div class="toggle-container">
+                            <span class="toggle-label">Sync</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" data-osc="0" data-param="sync">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <div class="oscillator">
+                        <h3>Oscillator 2</h3>
+                        <div class="waveform-display">
+                            <button class="waveform-button" data-osc="1" data-waveform="sine">Sine</button>
+                            <button class="waveform-button active" data-osc="1" data-waveform="saw">Saw</button>
+                            <button class="waveform-button" data-osc="1" data-waveform="square">Square</button>
+                            <button class="waveform-button" data-osc="1" data-waveform="triangle">Triangle</button>
+                            <button class="waveform-button" data-osc="1" data-waveform="noise">Noise</button>
+                        </div>
+                        <div class="controls-row">
+                            <div class="knob">
+                                <div class="knob-control" data-param="detune" data-osc="1"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Detune</div>
+                                <div class="knob-value" id="osc2-detune-value">+0.12</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="unison" data-osc="1"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Unison</div>
+                                <div class="knob-value">3</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="volume" data-osc="1"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Volume</div>
+                                <div class="knob-value" id="osc2-volume-value">0.6</div>
+                            </div>
+                        </div>
+                        <div class="toggle-container">
+                            <span class="toggle-label">Sync</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" data-osc="1" data-param="sync" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="wavetable-editor">
+                    <h3>Wavetable Editor</h3>
+                    <canvas class="wavetable-canvas" width="800" height="150"></canvas>
+                </div>
+            </div>
+            
+            <!-- Filter Section -->
+            <div class="section filter-section">
+                <h2>Filter</h2>
+                <div class="controls-row">
+                    <div class="knob">
+                        <div class="knob-control" data-param="cutoff"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Cutoff</div>
+                        <div class="knob-value" id="filter-cutoff-value">1200 Hz</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="resonance"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Resonance</div>
+                        <div class="knob-value" id="filter-resonance-value">0.6</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="drive"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Drive</div>
+                        <div class="knob-value">0.2</div>
+                    </div>
+                </div>
+                <div class="waveform-display">
+                    <button class="waveform-button active" data-filter="lowpass">Low Pass</button>
+                    <button class="waveform-button" data-filter="highpass">High Pass</button>
+                    <button class="waveform-button" data-filter="bandpass">Band Pass</button>
+                    <button class="waveform-button" data-filter="notch">Notch</button>
+                </div>
+                <div class="toggle-container">
+                    <span class="toggle-label">Filter Env</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" data-param="filterEnv" checked>
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+            
+            <!-- Envelope Section -->
+            <div class="section envelope-section">
+                <h2>Envelope</h2>
+                <div class="controls-row">
+                    <div class="knob">
+                        <div class="knob-control" data-param="attack"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Attack</div>
+                        <div class="knob-value" id="env-attack-value">10ms</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="decay"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Decay</div>
+                        <div class="knob-value" id="env-decay-value">200ms</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="sustain"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Sustain</div>
+                        <div class="knob-value" id="env-sustain-value">0.8</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="release"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Release</div>
+                        <div class="knob-value" id="env-release-value">300ms</div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- LFO Section -->
+            <div class="section lfo-section">
+                <h2>LFO</h2>
+                <div class="controls-row">
+                    <div class="knob">
+                        <div class="knob-control" data-param="lfoRate"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Rate</div>
+                        <div class="knob-value">2.5 Hz</div>
+                    </div>
+                    <div class="knob">
+                        <div class="knob-control" data-param="lfoAmount"><div class="knob-indicator"></div></div>
+                        <div class="knob-label">Amount</div>
+                        <div class="knob-value">0.4</div>
+                    </div>
+                </div>
+                <div class="waveform-display">
+                    <button class="waveform-button active">Sine</button>
+                    <button class="waveform-button">Saw</button>
+                    <button class="waveform-button">Square</button>
+                    <button class="waveform-button">Triangle</button>
+                </div>
+                <div class="toggle-container">
+                    <span class="toggle-label">Retrigger</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" data-param="lfoRetrigger">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+            
+            <!-- Effects Section -->
+            <div class="section effects-section">
+                <h2>Effects</h2>
+                <div class="oscillators">
+                    <div class="oscillator">
+                        <h3>Reverb</h3>
+                        <div class="controls-row">
+                            <div class="knob">
+                                <div class="knob-control" data-param="reverbAmount"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Amount</div>
+                                <div class="knob-value">0.3</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="reverbSize"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Size</div>
+                                <div class="knob-value">0.7</div>
+                            </div>
+                        </div>
+                        <div class="toggle-container">
+                            <span class="toggle-label">Enabled</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" data-param="reverbEnabled" checked>
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                    
+                    <div class="oscillator">
+                        <h3>Delay</h3>
+                        <div class="controls-row">
+                            <div class="knob">
+                                <div class="knob-control" data-param="delayTime"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Time</div>
+                                <div class="knob-value">0.5</div>
+                            </div>
+                            <div class="knob">
+                                <div class="knob-control" data-param="delayFeedback"><div class="knob-indicator"></div></div>
+                                <div class="knob-label">Feedback</div>
+                                <div class="knob-value">0.4</div>
+                            </div>
+                        </div>
+                        <div class="toggle-container">
+                            <span class="toggle-label">Enabled</span>
+                            <label class="toggle-switch">
+                                <input type="checkbox" data-param="delayEnabled">
+                                <span class="toggle-slider"></span>
+                            </label>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <!-- Modulation Matrix -->
+            <div class="section modulation-section">
+                <h2>Modulation Matrix</h2>
+                <div class="modulation-matrix">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Source → Target</th>
+                                <th>Osc 1 Pitch</th>
+                                <th>Osc 2 Pitch</th>
+                                <th>Filter Cutoff</th>
+                                <th>Amp</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>LFO 1</td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0.3"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                            </tr>
+                            <tr>
+                                <td>LFO 2</td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0.2"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                            </tr>
+                            <tr>
+                                <td>Env 1</td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="0.6"></td>
+                                <td><input type="range" min="-1" max="1" step="0.01" value="1.0"></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            
+            <!-- MIDI Section -->
+            <div class="section midi-section">
+                <h2>MIDI</h2>
+                <button id="enableMidi">Enable MIDI</button>
+                <div class="midi-status">Status: Not connected</div>
+                <div class="toggle-container">
+                    <span class="toggle-label">MIDI Learn</span>
+                    <label class="toggle-switch">
+                        <input type="checkbox" data-param="midiLearn">
+                        <span class="toggle-slider"></span>
+                    </label>
+                </div>
+            </div>
+            
+            <!-- Presets Section -->
+            <div class="section preset-section">
+                <h2>Presets</h2>
+                <div class="preset-manager">
+                    <select>
+                        <option>Init</option>
+                        <option>Bass 1</option>
+                        <option>Lead 1</option>
+                        <option>Pad 1</option>
+                        <option>Pluck 1</option>
+                    </select>
+                    <button>Save</button>
+                    <button>Load</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Spectrum Analyzer -->
+        <div class="section">
+            <h2>Spectrum Analyzer</h2>
+            <div class="spectrum-analyzer">
+                <canvas class="spectrum-canvas" width="800" height="150"></canvas>
+            </div>
+        </div>
+        
+        <!-- Keyboard -->
+        <div class="keyboard">
+            <div class="key white" data-note="60"><div class="key-label">C4</div></div>
+            <div class="key black" data-note="61"><div class="key-label">C#4</div></div>
+            <div class="key white" data-note="62"><div class="key-label">D4</div></div>
+            <div class="key black" data-note="63"><div class="key-label">D#4</div></div>
+            <div class="key white" data-note="64"><div class="key-label">E4</div></div>
+            <div class="key white" data-note="65"><div class="key-label">F4</div></div>
+            <div class="key black" data-note="66"><div class="key-label">F#4</div></div>
+            <div class="key white" data-note="67"><div class="key-label">G4</div></div>
+            <div class="key black" data-note="68"><div class="key-label">G#4</div></div>
+            <div class="key white" data-note="69"><div class="key-label">A4</div></div>
+            <div class="key black" data-note="70"><div class="key-label">A#4</div></div>
+            <div class="key white" data-note="71"><div class="key-label">B4</div></div>
+            <div class="key white" data-note="72"><div class="key-label">C5</div></div>
+        </div>
+    </div>
+
+    <!-- Only this script remains; all behavior is in web/main.js -->
+    <script type="module" src="web/main.js"></script>
+</body>
+</html>
