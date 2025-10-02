@@ -1,13 +1,12 @@
-// web/main.js (fixed)
-// This version initializes the UI even if the WASM file is missing or mis-served.
-// It dynamically imports the wasm bundle and falls back to a no-op synth,
-// so knobs always rotate & update labels. When wasm loads, sound works.
+// static/web/main.js
+// Initializes the UI even if the WASM file is missing or mis-served.
+// Falls back to a no-op synth so knobs rotate/update. When WASM loads, sound works.
 
 const BUFFER_SIZE = 1024;
 
-// Minimal no-op synth so UI doesn't crash if WASM isn't ready
+// ---------- tiny no-op synth (UI-safe fallback)
 const noopSynth = {
-  render_audio: (n) => (new Float32Array(n)),
+  render_audio: (n) => new Float32Array(n),
   set_parameter: () => {},
   set_wavetable: () => {},
   note_on: () => {},
@@ -47,7 +46,7 @@ function setWasmState(state, msg) {
   if (!wasmStatusEl) return;
   wasmStatusEl.textContent = `WebAssembly: ${msg}`;
   wasmStatusEl.classList.remove("ready","loading","error");
-  wasmStatusEl.classList.add(state); // ready | loading | error
+  wasmStatusEl.classList.add(state); // "ready" | "loading" | "error"
 }
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
@@ -115,15 +114,24 @@ function makeIR(ctx, dur = 2.0, decay = 2.0) {
   return buf;
 }
 
-// ---------- start synth (dynamic WASM import)
+// ---------- WASM loader (RELATIVE paths & explicit .wasm url)
 async function ensureWasmLoaded() {
   if (initWasm && SynthesizerCtor) return true;
   try {
     setWasmState("loading", "Loading...");
-    const mod = await import("../pkg/serum_wasm_backend.js");
+    // Adjust these two paths if your layout differs.
+    // With HTML: <script type="module" src="web/main.js"></script>
+    // this resolves to static/pkg/...
+    const jsUrl   = new URL("../pkg/serum_wasm_backend.js", import.meta.url);
+    const wasmUrl = new URL("../pkg/serum_wasm_backend_bg.wasm", import.meta.url);
+
+    const mod = await import(jsUrl.href);
     initWasm = mod.default;
     SynthesizerCtor = mod.Synthesizer;
-    await initWasm();
+
+    // Pass explicit .wasm URL so bundlers/servers don’t guess incorrectly.
+    await initWasm(wasmUrl.href);
+
     setWasmState("ready", "Loaded successfully");
     return true;
   } catch (e) {
@@ -142,11 +150,7 @@ export async function startSynth() {
   setAudioInitializing();
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
 
-  if (wasmOk && SynthesizerCtor) {
-    synth = new SynthesizerCtor(audioCtx.sampleRate);
-  } else {
-    synth = noopSynth; // still allow UI
-  }
+  synth = (wasmOk && SynthesizerCtor) ? new SynthesizerCtor(audioCtx.sampleRate) : noopSynth;
 
   fxNodes = createEffectsChain(audioCtx);
 
@@ -171,9 +175,8 @@ export async function startSynth() {
   return { audioCtx, analyserNode };
 }
 
-// ---------- UI (always attach, regardless of WASM)
+// ---------- UI (always attach)
 window.addEventListener("DOMContentLoaded", async () => {
-  // 1) Wire up all controls immediately
   wireWaveformButtons();
   wireLfoButtons();
   wireFilterButtons();
@@ -181,12 +184,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireToggles();
   wireModMatrix();
   wireKeyboard();
+  setupQwertyKeys();        // NEW: computer keyboard input
   wirePresets();
   setupWavetableEditor();
   setupSpectrum();
 
-  // 2) Try to bring up audio (sound will work only if wasm loaded)
-  //    Even if this throws, knobs will still rotate and show values.
   try { await startSynth(); } catch {}
 });
 
@@ -208,7 +210,6 @@ function wireWaveformButtons() {
 }
 
 function wireLfoButtons() {
-  // If you add data-lfo-waveform buttons in HTML, this will handle them
   $$('.lfo-waveform-button[data-lfo-waveform]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const parent = btn.closest('.lfo-waveform-display') || btn.parentElement;
@@ -222,7 +223,6 @@ function wireLfoButtons() {
   });
 
   // Your current LFO section uses generic .waveform-button without data attributes.
-  // That’s fine for UI highlight only; it won’t affect engine until you add data-lfo-waveform.
   const lfoButtons = document.querySelectorAll('.lfo-section .waveform-button');
   lfoButtons.forEach(btn=>{
     btn.addEventListener('click', ()=>{
@@ -238,16 +238,16 @@ function wireFilterButtons() {
       const parent = btn.closest('.waveform-display') || btn.parentElement;
       parent?.querySelectorAll('[data-filter]').forEach(b=>b.classList.remove('active'));
       btn.classList.add('active');
-      // If your DSP supports filter types, map here and call synth.set_parameter('filter_type', id)
+      // Map to engine param here if supported: synth.set_parameter('filter_type', id)
     });
   });
 }
 
 function wireKnobs() {
-  // Make sure the knob can visually rotate even if WASM isn’t loaded
-  // Tip: Add this CSS if you want smoother rotation (optional):
-  // .knob-control { transform-origin: 50% 50%; will-change: transform; }
   $$('.knob-control').forEach(knob => {
+    // Optional: smoother rotation
+    knob.style.transformOrigin = "50% 50%";
+
     const axis = (knob.getAttribute('data-axis') || 'both').toLowerCase();
     const uiMin = parseFloat(knob.getAttribute('data-min') ?? '0');
     const uiMax = parseFloat(knob.getAttribute('data-max') ?? '1');
@@ -283,9 +283,7 @@ function wireKnobs() {
       return 0.5;
     })();
 
-    function setVisual() {
-      knob.style.transform = `rotate(${currentRot}deg)`;
-    }
+    function setVisual() { knob.style.transform = `rotate(${currentRot}deg)`; }
 
     function applyParam(abs) {
       if (!param) return;
@@ -341,8 +339,6 @@ function wireKnobs() {
     }
 
     function setNorm(n) {
-      // constrain to [uiMin..uiMax] window for user feel,
-      // map to absolute [0..1] for engine
       const clamped = clamp01(n);
       const abs = clamp01((clamped - uiMin) / (uiMax - uiMin));
       norm = clamped;
@@ -366,7 +362,7 @@ function wireKnobs() {
       if (!dragging) return;
       const dx = (e.clientX - startX);
       const dy = (startY - e.clientY);
-      const base = e.shiftKey ? 0.002 : 0.01; // fine w/ Shift
+      const base = e.shiftKey ? 0.002 : 0.01; // fine adjust with Shift
       let delta;
       if (axis === 'x') delta = dx * base;
       else if (axis === 'y') delta = dy * base;
@@ -587,7 +583,7 @@ function setupWavetableEditor(){
       synth.set_wavetable?.(0, new Float32Array(table));
       synth.set_parameter?.('osc0_waveform', 5); // wavetable
       drawFFTPreview(table, pctx, preview.width, preview.height);
-    } catch (e) { console.error('pushToWasm error', e); }
+    } catch (e) { /* ignore UI-only mode */ }
   }
 
   function mkBtn(text, disabled=false){ const b=document.createElement('button'); b.textContent=text; b.disabled=disabled; return b; }
@@ -700,7 +696,41 @@ function setupSpectrum(){
   })();
 }
 
-// ---------- page-level auto-start on first gesture
+// ---------- QWERTY row → MIDI (Z/S/X/D/C/V/G/B/H/N/J/M/,)
+function setupQwertyKeys() {
+  // Map to C4..C5 (matches your on-screen keys)
+  const KEY2NOTE = {
+    'z':60, 's':61, 'x':62, 'd':63, 'c':64, 'v':65, 'g':66,
+    'b':67, 'h':68, 'n':69, 'j':70, 'm':71, ',':72
+  };
+  const pressed = new Set();
+
+  function press(note) {
+    pressed.add(note);
+    try { synth.note_on?.(note, 1.0); } catch {}
+    const el = document.querySelector(`.key[data-note="${note}"]`);
+    el?.classList.add('active');
+  }
+  function release(note) {
+    if (!pressed.has(note)) return;
+    pressed.delete(note);
+    try { synth.note_off?.(note); } catch {}
+    const el = document.querySelector(`.key[data-note="${note}"]`);
+    el?.classList.remove('active');
+  }
+
+  window.addEventListener('keydown', (e) => {
+    if (e.repeat) return;
+    const k = e.key.toLowerCase();
+    if (k in KEY2NOTE) { e.preventDefault(); press(KEY2NOTE[k]); }
+  });
+  window.addEventListener('keyup', (e) => {
+    const k = e.key.toLowerCase();
+    if (k in KEY2NOTE) { e.preventDefault(); release(KEY2NOTE[k]); }
+  });
+}
+
+// ---------- auto-start audio on first gesture
 document.addEventListener("pointerdown", async function firstTouch() {
   try { if (!isAudioInitialized) await startSynth(); } catch {}
   try { if (audioCtx && audioCtx.state !== "running") await audioCtx.resume(); } catch {}
