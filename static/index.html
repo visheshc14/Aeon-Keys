@@ -436,6 +436,116 @@
     </div>
 
     <!-- Only this script remains; all behavior is in web/main.js -->
+    <script>
+(() => {
+  if (window.__KNOB_FALLBACK_ATTACHED__) return;
+  window.__KNOB_FALLBACK_ATTACHED__ = true;
+
+  const $all = (s) => Array.from(document.querySelectorAll(s));
+  const clamp01 = (v) => Math.max(0, Math.min(1, v));
+  const rotFromNorm = (n) => -135 + n * 270;
+
+  $all('.knob-control').forEach(knob => {
+    // read optional UI limits
+    const uiMin = parseFloat(knob.getAttribute('data-min') ?? '0');
+    const uiMax = parseFloat(knob.getAttribute('data-max') ?? '1');
+
+    // default position (normalized)
+    const param = knob.getAttribute('data-param') || '';
+    const attrDefault = knob.getAttribute('data-default');
+    const defaultNorm = (attrDefault !== null)
+      ? clamp01(parseFloat(attrDefault))
+      : (param === 'detune' ? 0.5 :
+         (param === 'volume' || param === 'gain' || param === 'sustain') ? 0.7 :
+         (param === 'cutoff') ? 0.6 :
+         (param === 'resonance') ? 0.15 :
+         (param === 'attack' || param === 'decay' || param === 'release') ? 0.05 :
+         (param === 'lfoRate') ? 0.25 :
+         (param === 'lfoAmount') ? 0.0 :
+         (param === 'delayTime') ? 0.25 :
+         (param === 'delayFeedback') ? 0.2 :
+         (param === 'reverbAmount') ? 0.35 : 0.5);
+
+    let dragging = false;
+    let startX = 0, startY = 0;
+    let startNorm = 0;
+    let norm = defaultNorm;
+
+    // apply visual once at start
+    const setVisual = (abs) => {
+      knob.style.transform = `rotate(${rotFromNorm(abs)}deg)`;
+    };
+    const setNorm = (n) => {
+      const clamped = clamp01(n);
+      const abs = clamp01((clamped - uiMin) / (uiMax - uiMin));
+      norm = clamped;
+      setVisual(abs);
+
+      // show a reasonable label even if engine isn't present
+      const label = knob.closest('.knob')?.querySelector('.knob-value');
+      if (!label) return;
+      if (param === 'cutoff') {
+        const hz = Math.exp(Math.log(20) + abs * (Math.log(20000) - Math.log(20)));
+        label.textContent = `${Math.round(hz)} Hz`;
+      } else if (param === 'detune') {
+        const cents = abs * 100 - 50;
+        label.textContent = cents >= 0 ? `+${cents.toFixed(1)}` : cents.toFixed(1);
+      } else if (param === 'attack' || param === 'decay' || param === 'release') {
+        const s = abs * 2.0;
+        label.textContent = `${Math.round(s * 1000)}ms`;
+      } else if (param === 'lfoRate') {
+        const hz = abs * 10.0;
+        label.textContent = `${hz.toFixed(2)} Hz`;
+      } else {
+        label.textContent = abs.toFixed(2);
+      }
+    };
+
+    setNorm(defaultNorm);
+
+    knob.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      startNorm = norm;
+      knob.setPointerCapture?.(e.pointerId);
+      knob.style.cursor = 'grabbing';
+    });
+
+    knob.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = (e.clientX - startX);
+      const dy = (startY - e.clientY);
+      // choose the dominant axis so you can move left/right OR up/down
+      const base = e.shiftKey ? 0.002 : 0.01;
+      const delta = (Math.abs(dx) >= Math.abs(dy) ? dx : dy) * base;
+      setNorm(startNorm + delta);
+    });
+
+    knob.addEventListener('pointerup', (e) => {
+      dragging = false;
+      knob.releasePointerCapture?.(e.pointerId);
+      knob.style.cursor = 'grab';
+    });
+
+    knob.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const step = e.altKey ? 0.002 : (e.shiftKey ? 0.01 : 0.03);
+      const dir = e.deltaY < 0 ? 1 : -1;
+      setNorm(norm + dir * step);
+    }, { passive: false });
+
+    knob.addEventListener('dblclick', () => setNorm(defaultNorm));
+  });
+})();
+</script>
     <script type="module" src="web/main.js"></script>
+    <style> /* knob movement essentials */
+    .knob-control {
+    transform: rotate(0deg);        /* initial visual state */
+    transform-origin: 50% 50%;      /* rotate around center */
+    touch-action: none;             /* allow pointer drag on touch devices */
+}</style>
+
 </body>
 </html>

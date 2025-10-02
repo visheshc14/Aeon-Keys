@@ -1,128 +1,167 @@
-
-
-import initWasm, { Synthesizer } from "../pkg/serum_wasm_backend.js";
+// web/main.js (fixed)
+// This version initializes the UI even if the WASM file is missing or mis-served.
+// It dynamically imports the wasm bundle and falls back to a no-op synth,
+// so knobs always rotate & update labels. When wasm loads, sound works.
 
 const BUFFER_SIZE = 1024;
 
+// Minimal no-op synth so UI doesn't crash if WASM isn't ready
+const noopSynth = {
+  render_audio: (n) => (new Float32Array(n)),
+  set_parameter: () => {},
+  set_wavetable: () => {},
+  note_on: () => {},
+  note_off: () => {},
+  export_preset: () => "{}",
+  import_preset: () => true,
+};
+
 let audioCtx = null;
-let synth = null;
+let synth = noopSynth;
 let scriptNode = null;
 let analyserNode = null;
 let fxNodes = null;
 let isAudioInitialized = false;
 
-const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+let initWasm = null;
+let SynthesizerCtor = null;
 
-// Status UI (no markup changes) 
-const statusTextEl = document.getElementById("status-text");
-const audioDotEl   = document.getElementById("audio-status");
-const wasmStatusEl = document.getElementById("wasm-status");
+// ---------- small dom helpers
+const $  = (s) => document.querySelector(s);
+const $$ = (s) => Array.from(document.querySelectorAll(s));
+
+// ---------- status UI
+const statusTextEl = $("#status-text");
+const audioDotEl   = $("#audio-status");
+const wasmStatusEl = $("#wasm-status");
 
 function setAudioInitializing() {
-  statusTextEl && (statusTextEl.textContent = "Initializing audio engine...");
-  audioDotEl && audioDotEl.classList.remove("active");
+  if (statusTextEl) statusTextEl.textContent = "Initializing audio engine...";
+  audioDotEl?.classList.remove("active");
 }
 function setAudioReady() {
-  statusTextEl && (statusTextEl.textContent = "Audio engine ready - play some notes!");
-  audioDotEl && audioDotEl.classList.add("active");
+  if (statusTextEl) statusTextEl.textContent = "Audio engine ready - play some notes!";
+  audioDotEl?.classList.add("active");
 }
 function setWasmState(state, msg) {
   if (!wasmStatusEl) return;
   wasmStatusEl.textContent = `WebAssembly: ${msg}`;
-  wasmStatusEl.classList.remove("ready", "loading", "error");
-  wasmStatusEl.classList.add(state); // 'ready' | 'loading' | 'error'
+  wasmStatusEl.classList.remove("ready","loading","error");
+  wasmStatusEl.classList.add(state); // ready | loading | error
 }
 
-// FX chain (delay + reverb + analyser + master) 
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+
+// ---------- FX chain
 function createEffectsChain(ctx) {
   const input = ctx.createGain();
-  const master = ctx.createGain();
-  master.gain.value = 1.0;
+  const dry = ctx.createGain(); dry.gain.value = 1.0;
+  const master = ctx.createGain(); master.gain.value = 0.9;
 
-  // Delay
-  const delay = ctx.createDelay(5.0);
-  delay.delayTime.value = 0.5;
+  // delay
+  const delay = ctx.createDelay(5.0); delay.delayTime.value = 0.5;
   const fb = ctx.createGain(); fb.gain.value = 0.35;
   const delayWet = ctx.createGain(); delayWet.gain.value = 0.35;
   delay.connect(fb); fb.connect(delay);
 
-  // Convolver reverb
+  // reverb
   const convolver = ctx.createConvolver();
-  convolver.buffer = makeIR(ctx, 2.0, 2.0);
+  convolver.normalize = true;
+  convolver.buffer = makeIR(ctx, 2.5, 2.2);
   const reverbWet = ctx.createGain(); reverbWet.gain.value = 0.25;
 
-  // Analyser
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 2048;
+  // analyser
+  const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
 
-  // Routing
-  input.connect(master);                     // dry
+  // routing
+  input.connect(dry); dry.connect(master);
   input.connect(delay); delay.connect(delayWet); delayWet.connect(master);
   input.connect(convolver); convolver.connect(reverbWet); reverbWet.connect(master);
   master.connect(analyser);
+
+  function toggleConn(on, a, b, wet, to) {
+    try {
+      if (on) { a.connect(b); b.connect(wet); wet.connect(to); }
+      else { a.disconnect(b); b.disconnect(wet); wet.disconnect(to); }
+    } catch {}
+  }
 
   return {
     inputNode: input,
     masterNode: master,
     analyserNode: analyser,
-    setDelayEnabled: (v) => toggleConn(v, input, delay, delayWet, master),
-    setReverbEnabled: (v) => toggleConn(v, input, convolver, reverbWet, master),
+    setDelayEnabled: (v) => toggleConn(!!v, input, delay, delayWet, master),
+    setReverbEnabled: (v) => toggleConn(!!v, input, convolver, reverbWet, master),
     setDelayTime: (t) => { delay.delayTime.value = clamp(t, 0, 5.0); },
-    setDelayFeedback: (v) => { fb.gain.value = clamp(v, 0, 0.99); },
+    setDelayFeedback: (v) => { fb.gain.value = clamp(v, 0, 0.98); },
     setDelayWet: (v) => { delayWet.gain.value = clamp(v, 0, 1.0); },
     setReverbWet: (v) => { reverbWet.gain.value = clamp(v, 0, 1.0); },
-    setMasterGain: (v) => { master.gain.value = clamp(v, 0, 2.0); }
+    setMasterGain: (v) => { master.gain.value = clamp(v, 0, 2.0); },
   };
 }
-function toggleConn(on, a, b, wet, master) {
-  try { on ? (a.connect(b), b.connect(wet), wet.connect(master))
-           : (a.disconnect(b), b.disconnect(wet), wet.disconnect(master)); } catch {}
-}
+
 function makeIR(ctx, dur = 2.0, decay = 2.0) {
-  const sr = ctx.sampleRate, len = Math.floor(sr * dur);
+  const sr = ctx.sampleRate;
+  const len = Math.floor(sr * dur);
   const buf = ctx.createBuffer(2, len, sr);
   for (let ch = 0; ch < 2; ch++) {
     const d = buf.getChannelData(ch);
     for (let i = 0; i < len; i++) {
       const n = len - i;
-      d[i] = (Math.random() * 2 - 1) * Math.pow(n / len, decay);
+      const noise = (Math.random() * 2 - 1) * 0.5 + (Math.random() * 2 - 1) * 0.25;
+      d[i] = noise * Math.pow(n / len, decay);
     }
   }
   return buf;
 }
 
-//  Start synth (WASM + WebAudio) 
+// ---------- start synth (dynamic WASM import)
+async function ensureWasmLoaded() {
+  if (initWasm && SynthesizerCtor) return true;
+  try {
+    setWasmState("loading", "Loading...");
+    const mod = await import("../pkg/serum_wasm_backend.js");
+    initWasm = mod.default;
+    SynthesizerCtor = mod.Synthesizer;
+    await initWasm();
+    setWasmState("ready", "Loaded successfully");
+    return true;
+  } catch (e) {
+    console.warn("WASM not available (UI will still work):", e);
+    setWasmState("error", "Failed to load (UI active; no audio)");
+    return false;
+  }
+}
+
 export async function startSynth() {
   if (isAudioInitialized) return { audioCtx, analyserNode };
 
-  try {
-    setWasmState("loading", "Loading...");
-    await initWasm(); // loads wasm glue & module
-    setWasmState("ready", "Loaded successfully");
-  } catch (e) {
-    console.error("WASM init failed:", e);
-    setWasmState("error", `Failed to load - ${e?.message || e}`);
-    throw e;
-  }
+  // Try wasm, but don’t block the UI
+  const wasmOk = await ensureWasmLoaded();
 
   setAudioInitializing();
   audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-  synth = new Synthesizer(audioCtx.sampleRate);
+
+  if (wasmOk && SynthesizerCtor) {
+    synth = new SynthesizerCtor(audioCtx.sampleRate);
+  } else {
+    synth = noopSynth; // still allow UI
+  }
 
   fxNodes = createEffectsChain(audioCtx);
 
+  // connect script processor
   scriptNode = audioCtx.createScriptProcessor(BUFFER_SIZE, 0, 1);
   scriptNode.onaudioprocess = (evt) => {
     const out = evt.outputBuffer.getChannelData(0);
     try { out.set(synth.render_audio(out.length)); }
-    catch (err) { console.error("WASM render error:", err); out.fill(0); }
+    catch (err) { out.fill(0); }
   };
 
   scriptNode.connect(fxNodes.inputNode);
   analyserNode = fxNodes.analyserNode;
   analyserNode.connect(audioCtx.destination);
 
-  // reflect AudioContext state → header status
   audioCtx.onstatechange = () => {
     (audioCtx.state === "running") ? setAudioReady() : setAudioInitializing();
   };
@@ -132,154 +171,285 @@ export async function startSynth() {
   return { audioCtx, analyserNode };
 }
 
-// Start on first user gesture (also resumes if suspended)
-document.addEventListener("click", async function firstTouch() {
-  try { if (!isAudioInitialized) await startSynth(); } catch {}
-  try { if (audioCtx && audioCtx.state !== "running") await audioCtx.resume(); } catch {}
-  if (audioCtx && audioCtx.state === "running") setAudioReady();
-  document.removeEventListener("click", firstTouch);
-}, { once: true });
-
-// UI wiring 
-const $  = (s) => document.querySelector(s);
-const $$ = (s) => Array.from(document.querySelectorAll(s));
-
+// ---------- UI (always attach, regardless of WASM)
 window.addEventListener("DOMContentLoaded", async () => {
-  try { await startSynth(); } catch {}
+  // 1) Wire up all controls immediately
+  wireWaveformButtons();
+  wireLfoButtons();
+  wireFilterButtons();
+  wireKnobs();
+  wireToggles();
+  wireModMatrix();
+  wireKeyboard();
+  wirePresets();
+  setupWavetableEditor();
+  setupSpectrum();
 
-  // Waveform buttons
+  // 2) Try to bring up audio (sound will work only if wasm loaded)
+  //    Even if this throws, knobs will still rotate and show values.
+  try { await startSynth(); } catch {}
+});
+
+// ---------- Controls
+function wireWaveformButtons() {
   $$('.waveform-button[data-waveform]').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const parent = btn.closest('.waveform-display');
       parent?.querySelectorAll('.waveform-button').forEach(b=>b.classList.remove('active'));
       btn.classList.add('active');
+
       const osc = parseInt(btn.getAttribute('data-osc')||'0',10);
-      const wf = btn.getAttribute('data-waveform');
+      const wf = (btn.getAttribute('data-waveform')||'sine').toLowerCase();
       const map = { sine:0, saw:1, square:2, triangle:3, noise:4, wavetable:5 };
-      synth?.set_parameter(`osc${osc}_waveform`, map[wf] ?? 0);
+      const idx = map[wf] ?? 0;
+      try { synth.set_parameter?.(`osc${osc}_waveform`, idx); } catch {}
+    });
+  });
+}
+
+function wireLfoButtons() {
+  // If you add data-lfo-waveform buttons in HTML, this will handle them
+  $$('.lfo-waveform-button[data-lfo-waveform]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const parent = btn.closest('.lfo-waveform-display') || btn.parentElement;
+      parent?.querySelectorAll('.lfo-waveform-button').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      const wf = (btn.getAttribute('data-lfo-waveform')||'sine').toLowerCase();
+      const map = { sine:0, triangle:1, saw:2, square:3, random:4 };
+      const idx = map[wf] ?? 0;
+      try { synth.set_parameter?.('lfo0_waveform', idx); } catch {}
     });
   });
 
-  // Filter type (UI highlight only; engine is lowpass)
-  $$('[data-filter]').forEach(btn=>{
+  // Your current LFO section uses generic .waveform-button without data attributes.
+  // That’s fine for UI highlight only; it won’t affect engine until you add data-lfo-waveform.
+  const lfoButtons = document.querySelectorAll('.lfo-section .waveform-button');
+  lfoButtons.forEach(btn=>{
     btn.addEventListener('click', ()=>{
-      const parent = btn.closest('.waveform-display');
-      parent?.querySelectorAll('[data-filter]').forEach(b=>b.classList.remove('active'));
+      lfoButtons.forEach(b=>b.classList.remove('active'));
       btn.classList.add('active');
     });
   });
+}
 
-  // Knobs
-  $$('.knob-control').forEach(knob=>{
-    let drag=false, startY=0, startRot=0, rot=0;
-    knob.addEventListener('pointerdown', e=>{ drag=true; startY=e.clientY; startRot=rot; knob.setPointerCapture(e.pointerId); knob.style.cursor='grabbing'; });
-    knob.addEventListener('pointermove', e=>{
-      if(!drag) return;
-      const dy = startY - e.clientY;
-      rot = Math.max(-135, Math.min(135, startRot + dy*0.5));
-      knob.style.transform = `rotate(${rot}deg)`;
-      const t = (rot+135)/270; // 0..1
-      const label = knob.closest('.knob')?.querySelector('.knob-value');
-      const param = knob.getAttribute('data-param');
-      const oscIdx = knob.getAttribute('data-osc');
-
-      if (oscIdx !== null && oscIdx !== undefined && oscIdx !== "") {
-        const oi = parseInt(oscIdx,10);
-        if (param === 'detune'){
-          const cents = t*100 - 50;
-          label && (label.textContent = cents>=0? `+${cents.toFixed(1)}`:cents.toFixed(1));
-          synth?.set_parameter(`osc${oi}_detune`, cents);
-        } else if (param === 'volume' || param === 'gain'){
-          label && (label.textContent = t.toFixed(2));
-          synth?.set_parameter(`osc${oi}_gain`, t);
-        }
-      } else {
-        if (param === 'cutoff'){
-          const hz = Math.exp(Math.log(20) + t*(Math.log(20000)-Math.log(20)));
-          label && (label.textContent = `${Math.round(hz)} Hz`);
-          synth?.set_parameter('filter_cutoff', hz);
-        } else if (param === 'resonance'){
-          label && (label.textContent = t.toFixed(2));
-          synth?.set_parameter('filter_resonance', t);
-        } else if (param === 'attack'){
-          const s = t*2; label && (label.textContent = `${Math.round(s*1000)}ms`);
-          synth?.set_parameter('env_attack', s);
-        } else if (param === 'decay'){
-          const s = t*2; label && (label.textContent = `${Math.round(s*1000)}ms`);
-          synth?.set_parameter('env_decay', s);
-        } else if (param === 'sustain'){
-          label && (label.textContent = t.toFixed(2));
-          synth?.set_parameter('env_sustain', t);
-        } else if (param === 'release'){
-          const s = t*2; label && (label.textContent = `${Math.round(s*1000)}ms`);
-          synth?.set_parameter('env_release', s);
-        } else if (param === 'lfoRate'){
-          const hz = t*10; label && (label.textContent = `${hz.toFixed(2)} Hz`);
-          synth?.set_parameter('lfo0_rate', hz);
-        } else if (param === 'lfoAmount'){
-          label && (label.textContent = t.toFixed(2));
-          synth?.set_parameter('lfo0_amount', t);
-        } else if (param === 'delayTime'){
-          label && (label.textContent = t.toFixed(2));
-          fxNodes?.setDelayTime(t*2.0);
-          synth?.set_parameter('fx_delay_time', t*2.0);
-        } else if (param === 'delayFeedback'){
-          label && (label.textContent = t.toFixed(2));
-          fxNodes?.setDelayFeedback(t);
-          synth?.set_parameter('fx_delay_feedback', t);
-        } else if (param === 'reverbAmount'){
-          label && (label.textContent = t.toFixed(2));
-          fxNodes?.setReverbWet(t);
-          synth?.set_parameter('fx_reverb_wet', t);
-        }
-      }
+function wireFilterButtons() {
+  $$('[data-filter]').forEach(btn=>{
+    btn.addEventListener('click', ()=>{
+      const parent = btn.closest('.waveform-display') || btn.parentElement;
+      parent?.querySelectorAll('[data-filter]').forEach(b=>b.classList.remove('active'));
+      btn.classList.add('active');
+      // If your DSP supports filter types, map here and call synth.set_parameter('filter_type', id)
     });
-    knob.addEventListener('pointerup', e=>{ drag=false; knob.releasePointerCapture?.(e.pointerId); knob.style.cursor='grab'; });
   });
+}
 
-  // Toggles
+function wireKnobs() {
+  // Make sure the knob can visually rotate even if WASM isn’t loaded
+  // Tip: Add this CSS if you want smoother rotation (optional):
+  // .knob-control { transform-origin: 50% 50%; will-change: transform; }
+  $$('.knob-control').forEach(knob => {
+    const axis = (knob.getAttribute('data-axis') || 'both').toLowerCase();
+    const uiMin = parseFloat(knob.getAttribute('data-min') ?? '0');
+    const uiMax = parseFloat(knob.getAttribute('data-max') ?? '1');
+
+    let dragging = false;
+    let startX = 0, startY = 0;
+    let startNorm = 0; // [0..1]
+    let norm = 0.5;    // [0..1]
+    let currentRot = -135 + norm * 270;
+
+    const clamp01 = v => Math.max(0, Math.min(1, v));
+    const rotFromNorm = n => -135 + n * 270;
+
+    const valueDisplay = knob.closest('.knob')?.querySelector('.knob-value');
+    const param = knob.getAttribute('data-param');
+    const oscIdxAttr = knob.getAttribute('data-osc');
+    const hasOsc = oscIdxAttr !== null && oscIdxAttr !== '';
+    const oi = hasOsc ? parseInt(oscIdxAttr, 10) : 0;
+
+    const defaultNorm = (() => {
+      const attr = knob.getAttribute('data-default');
+      if (attr !== null) return clamp01(parseFloat(attr));
+      if (param === 'detune') return 0.5;
+      if (param === 'volume' || param === 'gain' || param === 'sustain') return 0.7;
+      if (param === 'cutoff') return 0.6;
+      if (param === 'resonance') return 0.15;
+      if (param === 'attack' || param === 'decay' || param === 'release') return 0.05;
+      if (param === 'lfoRate') return 0.25;
+      if (param === 'lfoAmount') return 0.0;
+      if (param === 'delayTime') return 0.25;
+      if (param === 'delayFeedback') return 0.2;
+      if (param === 'reverbAmount') return 0.35;
+      return 0.5;
+    })();
+
+    function setVisual() {
+      knob.style.transform = `rotate(${currentRot}deg)`;
+    }
+
+    function applyParam(abs) {
+      if (!param) return;
+      const show = (txt) => { if (valueDisplay) valueDisplay.textContent = txt; };
+
+      if (hasOsc) {
+        if (param === 'detune') {
+          const cents = abs * 100 - 50;
+          show(cents >= 0 ? `+${cents.toFixed(1)}` : cents.toFixed(1));
+          try { synth.set_parameter?.(`osc${oi}_detune`, cents); } catch {}
+        } else if (param === 'volume' || param === 'gain') {
+          show(abs.toFixed(2));
+          try { synth.set_parameter?.(`osc${oi}_gain`, abs); } catch {}
+        }
+        return;
+      }
+
+      if (param === 'cutoff') {
+        const hz = Math.exp(Math.log(20) + abs * (Math.log(20000) - Math.log(20)));
+        show(`${Math.round(hz)} Hz`);
+        try { synth.set_parameter?.('filter_cutoff', hz); } catch {}
+      } else if (param === 'resonance') {
+        show(abs.toFixed(2));
+        try { synth.set_parameter?.('filter_resonance', abs); } catch {}
+      } else if (param === 'attack') {
+        const s = abs * 2.0; show(`${Math.round(s * 1000)}ms`);
+        try { synth.set_parameter?.('env_attack', s); } catch {}
+      } else if (param === 'decay') {
+        const s = abs * 2.0; show(`${Math.round(s * 1000)}ms`);
+        try { synth.set_parameter?.('env_decay', s); } catch {}
+      } else if (param === 'sustain') {
+        show(abs.toFixed(2));
+        try { synth.set_parameter?.('env_sustain', abs); } catch {}
+      } else if (param === 'release') {
+        const s = abs * 2.0; show(`${Math.round(s * 1000)}ms`);
+        try { synth.set_parameter?.('env_release', s); } catch {}
+      } else if (param === 'lfoRate') {
+        const hz = abs * 10.0; show(`${hz.toFixed(2)} Hz`);
+        try { synth.set_parameter?.('lfo0_rate', hz); } catch {}
+      } else if (param === 'lfoAmount') {
+        show(abs.toFixed(2));
+        try { synth.set_parameter?.('lfo0_amount', abs); } catch {}
+      } else if (param === 'delayTime') {
+        const t = abs * 2.0; show(abs.toFixed(2));
+        try { fxNodes?.setDelayTime(t); synth.set_parameter?.('fx_delay_time', t); } catch {}
+      } else if (param === 'delayFeedback') {
+        show(abs.toFixed(2));
+        try { fxNodes?.setDelayFeedback(abs); synth.set_parameter?.('fx_delay_feedback', abs); } catch {}
+      } else if (param === 'reverbAmount') {
+        show(abs.toFixed(2));
+        try { fxNodes?.setReverbWet(abs); synth.set_parameter?.('fx_reverb_wet', abs); } catch {}
+      }
+    }
+
+    function setNorm(n) {
+      // constrain to [uiMin..uiMax] window for user feel,
+      // map to absolute [0..1] for engine
+      const clamped = clamp01(n);
+      const abs = clamp01((clamped - uiMin) / (uiMax - uiMin));
+      norm = clamped;
+      currentRot = rotFromNorm(abs);
+      setVisual();
+      applyParam(abs);
+    }
+
+    // init
+    setNorm(defaultNorm);
+
+    knob.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      startX = e.clientX;
+      startY = e.clientY;
+      startNorm = norm;
+      knob.setPointerCapture(e.pointerId);
+      knob.style.cursor = 'grabbing';
+    });
+    knob.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      const dx = (e.clientX - startX);
+      const dy = (startY - e.clientY);
+      const base = e.shiftKey ? 0.002 : 0.01; // fine w/ Shift
+      let delta;
+      if (axis === 'x') delta = dx * base;
+      else if (axis === 'y') delta = dy * base;
+      else delta = (Math.abs(dx) >= Math.abs(dy) ? dx : dy) * base;
+      setNorm(startNorm + delta);
+    });
+    knob.addEventListener('pointerup', (e) => {
+      dragging = false;
+      knob.releasePointerCapture?.(e.pointerId);
+      knob.style.cursor = 'grab';
+    });
+    knob.addEventListener('wheel', (e) => {
+      e.preventDefault();
+      const step = e.altKey ? 0.002 : (e.shiftKey ? 0.01 : 0.03);
+      const dir = e.deltaY < 0 ? 1 : -1;
+      setNorm(norm + dir * step);
+    }, { passive: false });
+    knob.addEventListener('dblclick', () => setNorm(defaultNorm));
+  });
+}
+
+function wireToggles() {
   $$('.toggle-switch input').forEach(t=>{
     t.addEventListener('change', function(){
       const param = this.getAttribute('data-param');
       const oscIdx = this.getAttribute('data-osc');
-      if (oscIdx !== null && oscIdx !== undefined && oscIdx !== "") {
+      if (oscIdx !== null && oscIdx !== "") {
         const oi = parseInt(oscIdx,10);
-        synth?.set_parameter(`osc${oi}_${param}`, this.checked ? 1.0 : 0.0);
+        try { synth.set_parameter?.(`osc${oi}_${param}`, this.checked ? 1.0 : 0.0); } catch {}
       } else {
         if (param === 'reverbEnabled') fxNodes?.setReverbEnabled(this.checked);
         if (param === 'delayEnabled')  fxNodes?.setDelayEnabled(this.checked);
-        if (param === 'filterEnv')     synth?.set_parameter('filter_env', this.checked ? 1.0 : 0.0);
-        if (param === 'lfoRetrigger')  synth?.set_parameter('lfo0_retrigger', this.checked ? 1.0 : 0.0);
+        if (param === 'filterEnv')     try { synth.set_parameter?.('filter_env', this.checked ? 1.0 : 0.0); } catch {}
+        if (param === 'lfoRetrigger')  try { synth.set_parameter?.('lfo0_retrigger', this.checked ? 1.0 : 0.0); } catch {}
       }
     });
   });
+}
 
-  // Mod matrix (filter routes)
+function wireModMatrix() {
   $$('.modulation-matrix input[type="range"]').forEach(r=>{
     r.addEventListener('input', ()=>{
       const tr = r.closest('tr'); if(!tr) return;
       const src = tr.children[0]?.textContent?.trim().toLowerCase() || '';
-      const td = r.closest('td'); const row = td.parentElement;
       const ths = Array.from(document.querySelectorAll('.modulation-matrix thead th')).map(th=>th.textContent.trim());
-      const idx = Array.prototype.indexOf.call(row.children, td);
-      const tgt = ths[idx];
+      const td = r.closest('td'); const idx = Array.prototype.indexOf.call(td.parentElement.children, td);
+      const tgt = (ths[idx] || '').toLowerCase();
       const v = parseFloat(r.value);
-      if (src.includes('lfo 1') && tgt.includes('Filter')) synth?.set_parameter('mod_lfo0_to_cutoff', v);
-      if (src.includes('lfo 2') && tgt.includes('Filter')) synth?.set_parameter('mod_lfo1_to_cutoff', v);
-      if (src.includes('env 1') && tgt.includes('Filter')) synth?.set_parameter('mod_env_to_cutoff', v);
+      try {
+        if (src.includes('lfo 1') && tgt.includes('filter')) synth.set_parameter?.('mod_lfo0_to_cutoff', v);
+        if (src.includes('lfo 2') && tgt.includes('filter')) synth.set_parameter?.('mod_lfo1_to_cutoff', v);
+        if (src.includes('env 1') && tgt.includes('filter')) synth.set_parameter?.('mod_env_to_cutoff', v);
+      } catch {}
     });
   });
+}
 
-  // Screen keyboard
+function wireKeyboard() {
   $$('.key').forEach(key=>{
-    key.addEventListener('mousedown', function(){ this.classList.add('active'); const n=parseInt(this.getAttribute('data-note')); synth?.note_on(n, 1.0); });
-    key.addEventListener('mouseup',   function(){ this.classList.remove('active'); const n=parseInt(this.getAttribute('data-note')); synth?.note_off(n); });
-    key.addEventListener('mouseleave',function(){ if(this.classList.contains('active')){ this.classList.remove('active'); const n=parseInt(this.getAttribute('data-note')); synth?.note_off(n); }});
+    key.addEventListener('mousedown', function(){
+      this.classList.add('active');
+      const n = parseInt(this.getAttribute('data-note'));
+      try { synth.note_on?.(n, 1.0); } catch {}
+    });
+    key.addEventListener('mouseup', function(){
+      this.classList.remove('active');
+      const n = parseInt(this.getAttribute('data-note'));
+      try { synth.note_off?.(n); } catch {}
+    });
+    key.addEventListener('mouseleave', function(){
+      if (this.classList.contains('active')) {
+        this.classList.remove('active');
+        const n = parseInt(this.getAttribute('data-note'));
+        try { synth.note_off?.(n); } catch {}
+      }
+    });
   });
+}
 
-  // Presets
+function wirePresets() {
   const presetSelect = document.querySelector('.preset-manager select');
-  const [saveBtn, loadBtn] = Array.from(document.querySelectorAll('.preset-manager button'));
+  const [saveBtn, loadBtn] = Array.from(document.querySelectorAll('.preset-manager button') || []);
+
   const refreshList = ()=>{
     if (!presetSelect) return;
     const keys = Object.keys(localStorage).filter(k=>k.startsWith('preset_'));
@@ -289,57 +459,65 @@ window.addEventListener("DOMContentLoaded", async () => {
     });
   };
   refreshList();
+
   saveBtn?.addEventListener('click', ()=>{
     const name = prompt('Preset name:'); if(!name) return;
-    const json = synth?.export_preset(); const str = (typeof json==='string')? json : json?.toString?.() ?? '{}';
-    localStorage.setItem(`preset_${name}`, str); refreshList(); alert(`Saved: ${name}`);
+    const json = synth.export_preset?.();
+    const str = (typeof json==='string') ? json : json?.toString?.() ?? '{}';
+    localStorage.setItem(`preset_${name}`, str);
+    refreshList();
+    alert(`Saved: ${name}`);
   });
+
   loadBtn?.addEventListener('click', ()=>{
     const name = presetSelect?.value; if(!name) return alert('Pick a preset');
     const raw = localStorage.getItem(`preset_${name}`); if(!raw) return alert('Empty preset');
-    const ok = synth?.import_preset(raw); alert(ok? `Loaded: ${name}`: 'Import failed');
+    const ok = synth.import_preset?.(raw);
+    alert(ok? `Loaded: ${name}` : 'Import failed');
   });
+}
 
-  // Wavetable editor → osc0
-  setupWavetableEditor();
-
-  // Spectrum analyzer
-  const specCanvas = document.querySelector('.spectrum-canvas');
-  if (specCanvas && analyserNode){
-    const ctx = specCanvas.getContext('2d');
-    const freq = new Uint8Array(analyserNode.frequencyBinCount);
-    (function draw(){
-      requestAnimationFrame(draw);
-      analyserNode.getByteFrequencyData(freq);
-      const w=specCanvas.width,h=specCanvas.height, bw=w/freq.length;
-      ctx.fillStyle='#000'; ctx.fillRect(0,0,w,h);
-      for(let i=0;i<freq.length;i++){
-        const v=freq[i]/255, bh=v*h;
-        ctx.fillStyle='#6af'; ctx.fillRect(i*bw, h-bh, bw-1, bh);
-      }
-    })();
-  }
-});
-
-// --- Wavetable editor (inline) ---
+// ---------- Wavetable editor (osc0)
 function setupWavetableEditor(){
   const canvas = document.querySelector('.wavetable-canvas'); if(!canvas) return;
-  const ctx = canvas.getContext('2d');
-  const N = 2048;
-  let table = new Float32Array(N); for(let i=0;i<N;i++) table[i]=2*(i/N)-1; // default saw
 
+  const ctx = canvas.getContext('2d');
+
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || canvas.width;
+  const cssH = canvas.clientHeight || canvas.height;
+  canvas.width = Math.floor(cssW * dpr);
+  canvas.height = Math.floor(cssH * dpr);
+  ctx.scale(dpr, dpr);
+
+  const width = cssW, height = cssH;
+
+  const N = 2048;
+  let table = new Float32Array(N);
+  for(let i=0;i<N;i++) table[i]=2*(i/N)-1; // saw
+
+  // small panel
   const panel = document.createElement('div');
+  panel.className = 'wt-editor-panel';
   panel.style.display='flex'; panel.style.gap='8px'; panel.style.marginTop='8px'; panel.style.flexWrap='wrap';
-  const freeBtn = btn('Freehand',true), addBtn = btn('Additive');
-  const normBtn = btn('Normalize'), clrBtn = btn('Clear'), saveBtn=btn('Save Slot');
+  const freeBtn = mkBtn('Freehand', true);
+  const addBtn  = mkBtn('Additive');
+  const normBtn = mkBtn('Normalize');
+  const clrBtn  = mkBtn('Clear');
+  const saveBtn = mkBtn('Save Slot');
   const loadSel = document.createElement('select'); loadSel.innerHTML='<option value="">--Load Slot--</option>';
   panel.append(freeBtn, addBtn, normBtn, clrBtn, saveBtn, loadSel);
   canvas.parentElement.insertBefore(panel, canvas.nextSibling);
 
-  const preview=document.createElement('canvas'); preview.width=300; preview.height=80; preview.style.border='1px solid #222';
-  panel.appendChild(preview); const pctx=preview.getContext('2d');
+  const preview = document.createElement('canvas');
+  preview.width=300; preview.height=80; preview.style.border='1px solid #222';
+  panel.appendChild(preview);
+  const pctx = preview.getContext('2d');
 
   let mode='freehand';
+  const harmonicPanel=document.createElement('div'); harmonicPanel.style.display='none'; harmonicPanel.style.marginTop='8px'; harmonicPanel.style.width='100%';
+  canvas.parentElement.insertBefore(harmonicPanel, panel.nextSibling);
+
   freeBtn.onclick=()=>{ mode='freehand'; freeBtn.disabled=true; addBtn.disabled=false; harmonicPanel.style.display='none'; };
   addBtn.onclick =()=>{ mode='additive'; freeBtn.disabled=false; addBtn.disabled=true; harmonicPanel.style.display='block'; };
 
@@ -350,51 +528,182 @@ function setupWavetableEditor(){
   refreshSlots();
   loadSel.onchange=()=>{ const v=loadSel.value; if(v==='')return; const raw=localStorage.getItem(`wavetable_slot_${v}`); if(!raw) return alert('Empty'); table=Float32Array.from(JSON.parse(raw)); render(); push(); };
 
-  const harmonicPanel=document.createElement('div'); harmonicPanel.style.display='none'; harmonicPanel.style.marginTop='8px'; canvas.parentElement.insertBefore(harmonicPanel, panel.nextSibling);
+  // harmonics
   const H=32; const row=document.createElement('div'); row.style.display='flex'; row.style.flexWrap='wrap'; row.style.gap='6px';
   harmonicPanel.appendChild(row);
   const harmonics=new Float32Array(H); harmonics[0]=1.0;
-  for(let i=0;i<H;i++){ const wrap=document.createElement('div'); wrap.style.display='flex'; wrap.style.flexDirection='column'; wrap.style.alignItems='center';
+  for(let i=0;i<H;i++){
+    const wrap=document.createElement('div'); wrap.style.display='flex'; wrap.style.flexDirection='column'; wrap.style.alignItems='center';
     const s=document.createElement('input'); s.type='range'; s.min='0'; s.max='1'; s.step='0.01'; s.value= i===0? '1.0':'0.0'; s.style.width='60px';
     const l=document.createElement('div'); l.style.fontSize='10px'; l.textContent=String(i+1);
     wrap.append(s,l); row.appendChild(wrap);
     s.oninput=()=>{ harmonics[i]=parseFloat(s.value); table = tableFromHarmonics(harmonics, N); render(); push(); };
   }
-  const resetH = btn('Reset Harmonics'); resetH.onclick=()=>{ row.querySelectorAll('input').forEach((s,idx)=>s.value= idx===0?'1.0':'0.0'); harmonics.fill(0); harmonics[0]=1; table=tableFromHarmonics(harmonics,N); render(); push(); };
+  const resetH = mkBtn('Reset Harmonics');
+  resetH.onclick=()=>{ row.querySelectorAll('input').forEach((s,idx)=>s.value= idx===0?'1.0':'0.0'); harmonics.fill(0); harmonics[0]=1; table=tableFromHarmonics(harmonics,N); render(); push(); };
   harmonicPanel.appendChild(resetH);
 
+  // freehand draw
   let drawing=false, pts=[];
   canvas.style.touchAction='none';
-  canvas.addEventListener('pointerdown',e=>{ drawing=true; pts=[]; const r=canvas.getBoundingClientRect(); pts.push({x:e.clientX-r.left,y:e.clientY-r.top}); });
-  canvas.addEventListener('pointermove',e=>{ if(!drawing) return; const r=canvas.getBoundingClientRect(); const x=Math.max(0,Math.min(canvas.width-1, e.clientX-r.left)); const y=Math.max(0,Math.min(canvas.height-1, e.clientY-r.top)); pts.push({x,y});
-    ctx.strokeStyle='#0f0'; ctx.lineWidth=2; ctx.beginPath(); const p0=pts[pts.length-2]||pts[0]; ctx.moveTo(p0.x,p0.y); ctx.lineTo(x,y); ctx.stroke(); });
-  canvas.addEventListener('pointerup',()=>{ if(!drawing) return; drawing=false; if(mode==='freehand'){ table = tableFromFreehand(pts, canvas, N); render(); push(); }});
+  canvas.addEventListener('pointerdown',e=>{
+    drawing=true; pts=[];
+    const r=canvas.getBoundingClientRect();
+    pts.push({x:(e.clientX-r.left), y:(e.clientY-r.top)});
+  });
+  canvas.addEventListener('pointermove',e=>{
+    if(!drawing) return;
+    const r=canvas.getBoundingClientRect();
+    const x=Math.max(0,Math.min(width-1, e.clientX-r.left));
+    const y=Math.max(0,Math.min(height-1, e.clientY-r.top));
+    pts.push({x,y});
+    // incremental stroke
+    ctx.strokeStyle='#0f0'; ctx.lineWidth=2; ctx.beginPath();
+    const p0=pts[pts.length-2]||pts[0];
+    ctx.moveTo(p0.x,p0.y); ctx.lineTo(x,y); ctx.stroke();
+  });
+  canvas.addEventListener('pointerup',()=>{
+    if(!drawing) return;
+    drawing=false;
+    if (mode==='freehand'){ table = tableFromFreehand(pts, width, height, N); render(); push(); }
+  });
 
   function render(){
-    const w=canvas.width,h=canvas.height; ctx.clearRect(0,0,w,h);
-    ctx.strokeStyle='#111'; ctx.lineWidth=1; for(let i=0;i<4;i++){ ctx.beginPath(); ctx.moveTo(0,i*(h/3)); ctx.lineTo(w,i*(h/3)); ctx.stroke(); }
+    ctx.clearRect(0,0,width,height);
+    // grid
+    ctx.strokeStyle='#111'; ctx.lineWidth=1; for(let i=0;i<4;i++){ ctx.beginPath(); ctx.moveTo(0,i*(height/3)); ctx.lineTo(width,i*(height/3)); ctx.stroke(); }
+    // waveform
     ctx.strokeStyle='#fff'; ctx.lineWidth=2; ctx.beginPath();
-    for(let x=0;x<w;x++){ const idx=Math.floor((x/w)*N); const v=table[idx]; const y=(1 - (v+1)/2) * h; x===0? ctx.moveTo(x,y) : ctx.lineTo(x,y); }
+    for(let x=0;x<width;x++){
+      const idx=Math.floor((x/width)*N); const v=table[idx];
+      const y=(1- (v+1)/2) * height;
+      if (x===0) ctx.moveTo(x,y); else ctx.lineTo(x,y);
+    }
     ctx.stroke();
   }
-  function push(){ try{ synth?.set_wavetable(0, new Float32Array(table)); synth?.set_parameter('osc0_waveform', 5); drawFFTPreview(table, pctx, preview.width, preview.height);}catch(e){console.error(e)} }
-  function btn(text, disabled=false){ const b=document.createElement('button'); b.textContent=text; b.disabled=disabled; return b; }
+
+  function push(){
+    try {
+      synth.set_wavetable?.(0, new Float32Array(table));
+      synth.set_parameter?.('osc0_waveform', 5); // wavetable
+      drawFFTPreview(table, pctx, preview.width, preview.height);
+    } catch (e) { console.error('pushToWasm error', e); }
+  }
+
+  function mkBtn(text, disabled=false){ const b=document.createElement('button'); b.textContent=text; b.disabled=disabled; return b; }
+
   function tableFromHarmonics(h, size){
-    const o=new Float32Array(size); for(let n=1;n<=h.length;n++){ const a=h[n-1]; if(Math.abs(a)<1e-6) continue; for(let i=0;i<size;i++){ const ph=(i/size)*2*Math.PI; o[i]+= a*Math.sin(n*ph); } }
-    let m=0; for(let i=0;i<size;i++) m=Math.max(m,Math.abs(o[i])); if(m>0) for(let i=0;i<size;i++) o[i]/=m; return o;
+    const o=new Float32Array(size);
+    for(let n=1;n<=h.length;n++){
+      const a=h[n-1]; if(Math.abs(a)<1e-6) continue;
+      for(let i=0;i<size;i++){
+        const ph=(i/size)*2*Math.PI;
+        o[i]+= a*Math.sin(n*ph);
+      }
+    }
+    let m=0; for(let i=0;i<size;i++) m=Math.max(m,Math.abs(o[i]));
+    if(m>0) for(let i=0;i<size;i++) o[i]/=m;
+    return o;
   }
-  function tableFromFreehand(points, cvs, size){
-    const w=cvs.width, h=cvs.height; const s=new Float32Array(w), c=new Uint16Array(w);
-    for(const p of points){ const x=Math.max(0,Math.min(w-1, Math.round(p.x))); const v=1-(p.y/h); const val=v*2-1; s[x]+=val; c[x]+=1; }
+
+  function tableFromFreehand(points, w, h, size){
+    const s=new Float32Array(w), c=new Uint16Array(w);
+    for(const p of points){
+      const x=Math.max(0,Math.min(w-1, Math.round(p.x)));
+      const v=1-(p.y/h);
+      const val=v*2-1;
+      s[x]+=val; c[x]+=1;
+    }
     for(let x=0;x<w;x++) s[x]= c[x]? s[x]/c[x] : 0.0;
-    let last=s[0]; for(let x=0;x<w;x++){ if(c[x]===0){ let nx=x+1; while(nx<w&&c[nx]===0) nx++; const nv= nx<w? s[nx]: last; const span=nx-x+1; for(let k=0;k<(nx-x);k++) s[x+k]= last + (nv-last)*((k+1)/span); x=nx; last=nv; } else last=s[x]; }
-    const out=new Float32Array(size); for(let i=0;i<size;i++){ const idx=(i/size)*w; const i0=Math.floor(idx), i1=Math.min(w-1,i0+1); const frac=idx-i0; out[i]= s[i0]*(1-frac)+s[i1]*frac; } return out;
+    // fill gaps
+    let last=s[0];
+    for(let x=0;x<w;x++){
+      if(c[x]===0){
+        let nx=x+1; while(nx<w && c[nx]===0) nx++;
+        const nv = (nx<w)? s[nx] : last;
+        const span = nx-x+1;
+        for(let k=0;k<(nx-x);k++) s[x+k] = last + (nv-last)*((k+1)/span);
+        x=nx; last=nv;
+      } else last=s[x];
+    }
+    // resample
+    const out=new Float32Array(size);
+    for(let i=0;i<size;i++){
+      const idx=(i/size)*w;
+      const i0=Math.floor(idx), i1=Math.min(w-1,i0+1);
+      const frac=idx-i0;
+      out[i]= s[i0]*(1-frac)+s[i1]*frac;
+    }
+    return out;
   }
+
   function drawFFTPreview(arr, pctx, w, h){
     const N=256, mags=new Float32Array(N);
-    for(let k=0;k<N;k++){ let re=0,im=0; for(let n=0;n<arr.length;n+=Math.floor(arr.length/N)){ const ph=2*Math.PI*k*n/arr.length; re+=arr[n]*Math.cos(ph); im-=arr[n]*Math.sin(ph); } mags[k]=Math.hypot(re,im); }
-    let m=0; for(let i=0;i<N;i++) m=Math.max(m,mags[i]); pctx.clearRect(0,0,w,h); pctx.fillStyle='#111'; pctx.fillRect(0,0,w,h);
-    if(m===0) return; for(let i=0;i<N;i++){ const v=mags[i]/m; const x=(i/N)*w; const bar=v*h; pctx.fillStyle='#0f0'; pctx.fillRect(x, h-bar, w/N-1, bar); }
+    const stride = Math.max(1, Math.floor(arr.length / (N*2)));
+    for(let k=0;k<N;k++){
+      let re=0,im=0;
+      for(let n=0;n<arr.length;n+=stride){
+        const ph=2*Math.PI*k*n/arr.length;
+        re+=arr[n]*Math.cos(ph);
+        im-=arr[n]*Math.sin(ph);
+      }
+      mags[k]=Math.hypot(re,im);
+    }
+    let m=0; for(let i=0;i<N;i++) m=Math.max(m,mags[i]);
+    pctx.clearRect(0,0,w,h);
+    pctx.fillStyle='#111'; pctx.fillRect(0,0,w,h);
+    if(m===0) return;
+    const bw = w/N;
+    pctx.fillStyle='#0f0';
+    for(let i=0;i<N;i++){
+      const v=mags[i]/m;
+      const bar=v*h;
+      pctx.fillRect(i*bw, h-bar, Math.max(1, bw-1), bar);
+    }
   }
-  (function init(){ render(); push(); })();
+
+  render(); push();
 }
+
+// ---------- Spectrum
+function setupSpectrum(){
+  const specCanvas = document.querySelector('.spectrum-canvas');
+  if (!specCanvas) return;
+  const ctx = specCanvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = specCanvas.clientWidth || specCanvas.width;
+  const cssH = specCanvas.clientHeight || specCanvas.height;
+  specCanvas.width = Math.floor(cssW * dpr);
+  specCanvas.height = Math.floor(cssH * dpr);
+  ctx.scale(dpr, dpr);
+
+  const freqData = () => {
+    if (!analyserNode) return null;
+    const f = new Uint8Array(analyserNode.frequencyBinCount);
+    analyserNode.getByteFrequencyData(f);
+    return f;
+  };
+
+  (function draw(){
+    requestAnimationFrame(draw);
+    const f = freqData();
+    const w = cssW, h = cssH;
+    ctx.clearRect(0,0,w,h);
+    ctx.fillStyle = '#000'; ctx.fillRect(0,0,w,h);
+    if (!f) return;
+    const bw = w / f.length;
+    ctx.fillStyle = '#6af';
+    for (let i=0;i<f.length;i++) {
+      const v = f[i] / 255, bh = v * h;
+      ctx.fillRect(i*bw, h-bh, Math.max(1, bw-1), bh);
+    }
+  })();
+}
+
+// ---------- page-level auto-start on first gesture
+document.addEventListener("pointerdown", async function firstTouch() {
+  try { if (!isAudioInitialized) await startSynth(); } catch {}
+  try { if (audioCtx && audioCtx.state !== "running") await audioCtx.resume(); } catch {}
+  if (audioCtx && audioCtx.state === "running") setAudioReady();
+  document.removeEventListener("pointerdown", firstTouch);
+}, { once: true });
