@@ -1,4 +1,4 @@
-#  Aeon Key - Serum-Like Web Synth (Rust + WebAssembly + Web Audio API)
+#  Aeon Keys - Serum-Like Web Synth (Rust + WebAssembly + Web Audio API)
 
 A browser-based **software synthesizer** inspired by Xfer Serum, built using **Rust (compiled to WebAssembly)** and the **Web Audio API**.  
 It provides a **modern synth UI** with **oscillators, filters, envelopes, LFOs, effects, modulation matrix, wavetable editor, presets, MIDI input, and spectrum analyzers** — all running **directly in your browser**.
@@ -51,4 +51,30 @@ It provides a **modern synth UI** with **oscillators, filters, envelopes, LFOs, 
 ###  Presets
 - Save/load presets with **LocalStorage**  
 - Quick recall of custom patches  
+---
+
+##  Getting Started
+
+### 1. Build Rust → WASM
+```bash
+# Install wasm-pack if missing
+cargo install wasm-pack
+
+# Build the Rust synth backend
+wasm-pack build --target web --out-dir ./static/pkg
+```
+
+### 2. Run a Local Dev Server 
+```bash
+# Using Python
+cd static
+python3 -m http.server 8000
+
+# OR using Node
+npx serve static
+```
+---
+
+
+
 
