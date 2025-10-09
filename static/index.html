@@ -3,7 +3,16 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Serum-like Synthesizer with Rust/WASM</title>
+    <!-- Favicons: AeonKeys -->
+    <link rel="icon" href="/static/favicon.ico?v=1" sizes="any">
+    <link rel="icon" type="image/png" sizes="32x32" href="/static/favicon-32.png?v=1">
+    <link rel="icon" type="image/png" sizes="16x16" href="/static/favicon-16.png?v=1">
+    <link rel="apple-touch-icon" href="/static/apple-touch-icon.png?v=1">
+
+    <!-- PWA / Android -->
+    <link rel="manifest" href="/static/site.webmanifest?v=1">
+    <meta name="theme-color" content="#000000"> 
+    <title>Aeon Keys - Serum-like Synthesizer with Rust/WASM</title>
     <style>
         /* Base styles */
         * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Helvetica','Arial',sans-serif; }
@@ -102,8 +111,8 @@
 <body>
     <div class="app">
         <header>
-            <h1>Serum-like Synthesizer</h1>
-            <p>Advanced wavetable synthesizer built with Rust & WebAssembly</p>
+            <h1>Aeon Keys - Serum-like Synthesizer</h1>
+            <p>Advanced Wavetable Synthesizer Built with Rust & WebAssembly</p>
             <div class="status-container">
                 <span class="status-indicator" id="audio-status"></span>
                 <span id="status-text">Initializing audio engine...</span>
@@ -550,6 +559,7 @@
     transform-origin: 50% 50%;      /* rotate around center */
     touch-action: none;             /* allow pointer drag on touch devices */
 }</style>
+
 
 </body>
 </html>
