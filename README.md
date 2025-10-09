@@ -3,7 +3,7 @@
 A browser-based **software synthesizer** inspired by Xfer Serum, built using **Rust (compiled to WebAssembly)** and the **Web Audio API**.  
 It provides a **modern synth UI** with **oscillators, filters, envelopes, LFOs, effects, modulation matrix, wavetable editor, presets, MIDI input, and spectrum analyzers** — all running **directly in your browser**.
 
-<img width="624" height="1008" alt="Screenshot 2025-10-02 at 10 47 55 PM" src="https://github.com/user-attachments/assets/a3025138-615f-425c-970c-145abfb43ce1" />
+<img width="637" height="1006" alt="Screenshot 2025-10-09 at 2 56 29 PM" src="https://github.com/user-attachments/assets/2c267efa-891a-4479-a0eb-4b334a9c8e39" />
 
 ---
 
