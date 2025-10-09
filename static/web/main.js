@@ -1,6 +1,8 @@
 // static/web/main.js
 // Initializes the UI even if the WASM file is missing or mis-served.
 // Falls back to a no-op synth so knobs rotate/update. When WASM loads, sound works.
+// Includes QWERTY keyboard input and a Record button (WebM/Opus) that captures the master mix,
+// reusing the EXISTING #record-btn in your HTML and appending a download link next to it.
 
 const BUFFER_SIZE = 1024;
 
@@ -19,11 +21,19 @@ let audioCtx = null;
 let synth = noopSynth;
 let scriptNode = null;
 let analyserNode = null;
-let fxNodes = null;
+let fxNodes = null;        // analyser/recorder path only (FX hard-bypassed)
 let isAudioInitialized = false;
 
 let initWasm = null;
 let SynthesizerCtor = null;
+
+// Recorder bits
+let recorderDest = null;
+let mediaRecorder = null;
+let recordChunks = [];
+let recordBtn = null;      // must exist in HTML: <button id="record-btn">● Record</button>
+let downloadLink = null;   // appended after #record-btn
+let isStopping = false;
 
 // ---------- small dom helpers
 const $  = (s) => document.querySelector(s);
@@ -51,50 +61,44 @@ function setWasmState(state, msg) {
 
 const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
 
-// ---------- FX chain
+// ---------- Analyser/recorder chain (FX hard-bypassed here; real FX happen in WASM)
 function createEffectsChain(ctx) {
   const input = ctx.createGain();
   const dry = ctx.createGain(); dry.gain.value = 1.0;
   const master = ctx.createGain(); master.gain.value = 0.9;
 
-  // delay
+  // Delay/reverb nodes exist only so the graph stays stable, but are muted
   const delay = ctx.createDelay(5.0); delay.delayTime.value = 0.5;
-  const fb = ctx.createGain(); fb.gain.value = 0.35;
-  const delayWet = ctx.createGain(); delayWet.gain.value = 0.35;
+  const fb = ctx.createGain(); fb.gain.value = 0.0;
+  const delayWet = ctx.createGain(); delayWet.gain.value = 0.0; // HARD BYPASS
+
   delay.connect(fb); fb.connect(delay);
 
-  // reverb
   const convolver = ctx.createConvolver();
   convolver.normalize = true;
   convolver.buffer = makeIR(ctx, 2.5, 2.2);
-  const reverbWet = ctx.createGain(); reverbWet.gain.value = 0.25;
+  const reverbWet = ctx.createGain(); reverbWet.gain.value = 0.0; // HARD BYPASS
 
-  // analyser
   const analyser = ctx.createAnalyser(); analyser.fftSize = 2048;
 
-  // routing
+  // routing (audible path is input->dry->master only)
   input.connect(dry); dry.connect(master);
+  // keep muted branches connected so toggling doesn't pop
   input.connect(delay); delay.connect(delayWet); delayWet.connect(master);
   input.connect(convolver); convolver.connect(reverbWet); reverbWet.connect(master);
   master.connect(analyser);
-
-  function toggleConn(on, a, b, wet, to) {
-    try {
-      if (on) { a.connect(b); b.connect(wet); wet.connect(to); }
-      else { a.disconnect(b); b.disconnect(wet); wet.disconnect(to); }
-    } catch {}
-  }
 
   return {
     inputNode: input,
     masterNode: master,
     analyserNode: analyser,
-    setDelayEnabled: (v) => toggleConn(!!v, input, delay, delayWet, master),
-    setReverbEnabled: (v) => toggleConn(!!v, input, convolver, reverbWet, master),
-    setDelayTime: (t) => { delay.delayTime.value = clamp(t, 0, 5.0); },
-    setDelayFeedback: (v) => { fb.gain.value = clamp(v, 0, 0.98); },
-    setDelayWet: (v) => { delayWet.gain.value = clamp(v, 0, 1.0); },
-    setReverbWet: (v) => { reverbWet.gain.value = clamp(v, 0, 1.0); },
+    // No-ops: FX handled inside WASM now
+    setDelayEnabled: (_v) => {},
+    setReverbEnabled: (_v) => {},
+    setDelayTime: (_t) => {},
+    setDelayFeedback: (_v) => {},
+    setDelayWet: (_v) => {},
+    setReverbWet: (_v) => {},
     setMasterGain: (v) => { master.gain.value = clamp(v, 0, 2.0); },
   };
 }
@@ -119,9 +123,6 @@ async function ensureWasmLoaded() {
   if (initWasm && SynthesizerCtor) return true;
   try {
     setWasmState("loading", "Loading...");
-    // Adjust these two paths if your layout differs.
-    // With HTML: <script type="module" src="web/main.js"></script>
-    // this resolves to static/pkg/...
     const jsUrl   = new URL("../pkg/serum_wasm_backend.js", import.meta.url);
     const wasmUrl = new URL("../pkg/serum_wasm_backend_bg.wasm", import.meta.url);
 
@@ -129,7 +130,6 @@ async function ensureWasmLoaded() {
     initWasm = mod.default;
     SynthesizerCtor = mod.Synthesizer;
 
-    // Pass explicit .wasm URL so bundlers/servers don’t guess incorrectly.
     await initWasm(wasmUrl.href);
 
     setWasmState("ready", "Loaded successfully");
@@ -166,6 +166,9 @@ export async function startSynth() {
   analyserNode = fxNodes.analyserNode;
   analyserNode.connect(audioCtx.destination);
 
+  // Hook up recorder to master
+  setupRecorder(fxNodes.masterNode);
+
   audioCtx.onstatechange = () => {
     (audioCtx.state === "running") ? setAudioReady() : setAudioInitializing();
   };
@@ -184,10 +187,11 @@ window.addEventListener("DOMContentLoaded", async () => {
   wireToggles();
   wireModMatrix();
   wireKeyboard();
-  setupQwertyKeys();        // NEW: computer keyboard input
+  setupQwertyKeys();        // computer keyboard input (Z/S/X/D/…)
   wirePresets();
   setupWavetableEditor();
   setupSpectrum();
+  ensureRecordUI();         // reuse existing #record-btn and append a link
 
   try { await startSynth(); } catch {}
 });
@@ -222,7 +226,6 @@ function wireLfoButtons() {
     });
   });
 
-  // Your current LFO section uses generic .waveform-button without data attributes.
   const lfoButtons = document.querySelectorAll('.lfo-section .waveform-button');
   lfoButtons.forEach(btn=>{
     btn.addEventListener('click', ()=>{
@@ -245,7 +248,6 @@ function wireFilterButtons() {
 
 function wireKnobs() {
   $$('.knob-control').forEach(knob => {
-    // Optional: smoother rotation
     knob.style.transformOrigin = "50% 50%";
 
     const axis = (knob.getAttribute('data-axis') || 'both').toLowerCase();
@@ -328,13 +330,13 @@ function wireKnobs() {
         try { synth.set_parameter?.('lfo0_amount', abs); } catch {}
       } else if (param === 'delayTime') {
         const t = abs * 2.0; show(abs.toFixed(2));
-        try { fxNodes?.setDelayTime(t); synth.set_parameter?.('fx_delay_time', t); } catch {}
+        try { synth.set_parameter?.('fx_delay_time', t); } catch {}
       } else if (param === 'delayFeedback') {
         show(abs.toFixed(2));
-        try { fxNodes?.setDelayFeedback(abs); synth.set_parameter?.('fx_delay_feedback', abs); } catch {}
+        try { synth.set_parameter?.('fx_delay_feedback', abs); } catch {}
       } else if (param === 'reverbAmount') {
         show(abs.toFixed(2));
-        try { fxNodes?.setReverbWet(abs); synth.set_parameter?.('fx_reverb_wet', abs); } catch {}
+        try { synth.set_parameter?.('fx_reverb_wet', abs); } catch {}
       }
     }
 
@@ -393,8 +395,9 @@ function wireToggles() {
         const oi = parseInt(oscIdx,10);
         try { synth.set_parameter?.(`osc${oi}_${param}`, this.checked ? 1.0 : 0.0); } catch {}
       } else {
-        if (param === 'reverbEnabled') fxNodes?.setReverbEnabled(this.checked);
-        if (param === 'delayEnabled')  fxNodes?.setDelayEnabled(this.checked);
+        // Route FX toggles to WASM wet amounts (JS FX are bypassed)
+        if (param === 'reverbEnabled') try { synth.set_parameter?.('fx_reverb_wet', this.checked ? 0.35 : 0.0); } catch {}
+        if (param === 'delayEnabled')  try { synth.set_parameter?.('fx_delay_wet',  this.checked ? 0.35 : 0.0); } catch {}
         if (param === 'filterEnv')     try { synth.set_parameter?.('filter_env', this.checked ? 1.0 : 0.0); } catch {}
         if (param === 'lfoRetrigger')  try { synth.set_parameter?.('lfo0_retrigger', this.checked ? 1.0 : 0.0); } catch {}
       }
@@ -698,7 +701,6 @@ function setupSpectrum(){
 
 // ---------- QWERTY row → MIDI (Z/S/X/D/C/V/G/B/H/N/J/M/,)
 function setupQwertyKeys() {
-  // Map to C4..C5 (matches your on-screen keys)
   const KEY2NOTE = {
     'z':60, 's':61, 'x':62, 'd':63, 'c':64, 'v':65, 'g':66,
     'b':67, 'h':68, 'n':69, 'j':70, 'm':71, ',':72
@@ -723,6 +725,7 @@ function setupQwertyKeys() {
     if (e.repeat) return;
     const k = e.key.toLowerCase();
     if (k in KEY2NOTE) { e.preventDefault(); press(KEY2NOTE[k]); }
+    if (audioCtx && audioCtx.state !== "running") audioCtx.resume().catch(()=>{});
   });
   window.addEventListener('keyup', (e) => {
     const k = e.key.toLowerCase();
@@ -730,10 +733,204 @@ function setupQwertyKeys() {
   });
 }
 
-// ---------- auto-start audio on first gesture
-document.addEventListener("pointerdown", async function firstTouch() {
-  try { if (!isAudioInitialized) await startSynth(); } catch {}
-  try { if (audioCtx && audioCtx.state !== "running") await audioCtx.resume(); } catch {}
-  if (audioCtx && audioCtx.state === "running") setAudioReady();
-  document.removeEventListener("pointerdown", firstTouch);
-}, { once: true });
+// ---------- Download link inline button style (no external CSS)
+function styleAsButton(el) {
+  Object.assign(el.style, {
+    display: "inline-block",
+    padding: "8px 12px",
+    backgroundColor: "#222",
+    color: "#fff",
+    border: "1px solid #333",
+    borderRadius: "3px",
+    textDecoration: "none",
+    cursor: "pointer",
+    fontSize: "0.9rem",
+    marginLeft: "12px",
+    transition: "background-color .2s",
+  });
+  el.onmouseenter = () => { el.style.backgroundColor = "#333"; };
+  el.onmouseleave = () => { el.style.backgroundColor = "#222"; };
+}
+
+// ---------- Recorder UI + setup (supports #recordBtn or #record-btn)
+function hideDownloadLink() {
+  if (!downloadLink) return;
+  // Revoke any previous blob URL we put on the link
+  const prev = downloadLink.dataset.prevUrl;
+  if (prev) { try { URL.revokeObjectURL(prev); } catch {} }
+  downloadLink.removeAttribute("href");
+  downloadLink.removeAttribute("download");
+  downloadLink.dataset.prevUrl = "";
+  downloadLink.style.display = "none";
+  downloadLink.setAttribute("aria-disabled", "true");
+}
+
+function showDownloadLink(url) {
+  if (!downloadLink) return;
+  // Revoke any older URL first
+  const prev = downloadLink.dataset.prevUrl;
+  if (prev) { try { URL.revokeObjectURL(prev); } catch {} }
+  downloadLink.href = url;
+  downloadLink.dataset.prevUrl = url;
+  downloadLink.download = `take-${new Date().toISOString().replace(/[:.]/g,'-')}.webm`;
+  downloadLink.style.display = "inline-block";
+  downloadLink.textContent = "Download last take";
+  downloadLink.removeAttribute("aria-disabled");
+}
+
+function ensureRecordUI() {
+  recordBtn = document.getElementById("recordBtn") || document.getElementById("record-btn");
+  if (!recordBtn) {
+    console.warn('No record button found. Add <button id="recordBtn">⏺ Record</button> or <button id="record-btn">⏺ Record</button>.');
+    return;
+  }
+
+  // Create/attach sibling download link
+  downloadLink =
+    document.getElementById("record-download") ||
+    (() => {
+      const a = document.createElement("a");
+      a.id = "record-download";
+      a.textContent = "Download last take";
+      a.style.display = "none";      // hidden until we have a blob
+      a.setAttribute("role", "button");
+      a.setAttribute("aria-disabled", "true");
+      a.dataset.prevUrl = "";
+      recordBtn.insertAdjacentElement("afterend", a);
+      return a;
+    })();
+
+  // Make link look/behave like a button via inline styles
+  styleAsButton(downloadLink);
+  downloadLink.setAttribute("role", "button");
+  downloadLink.setAttribute("aria-disabled", "true");
+
+  // Always start hidden (covers refresh, HMR, etc.)
+  hideDownloadLink();
+
+  // Avoid double-binding (hot reload etc.)
+  if (!recordBtn.dataset.wired) {
+    recordBtn.addEventListener("click", toggleRecording);
+    window.addEventListener("keydown", onRecordKey);
+    recordBtn.dataset.wired = "1";
+  }
+
+  // Keyboard activation for the link (a11y)
+  if (!downloadLink.dataset.wired) {
+    downloadLink.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" || e.key === " ") { e.preventDefault(); downloadLink.click(); }
+    });
+    downloadLink.dataset.wired = "1";
+  }
+
+  // Hide stale link when page is restored from bfcache
+  if (!window.__recorderPageHandlers) {
+    window.addEventListener("pageshow", () => hideDownloadLink());
+    // Cleanup on navigate away
+    window.addEventListener("pagehide", () => hideDownloadLink());
+    window.addEventListener("beforeunload", () => hideDownloadLink());
+    window.__recorderPageHandlers = 1;
+  }
+
+  recordBtn.setAttribute("aria-pressed", "false");
+}
+
+function onRecordKey(e) {
+  if (e.key && e.key.toLowerCase() === "r") toggleRecording();
+}
+
+// Make it async so a click can boot everything up
+async function toggleRecording() {
+  if (isStopping) return;
+
+  try {
+    if (!isAudioInitialized) await startSynth();
+    if (audioCtx && audioCtx.state !== "running") await audioCtx.resume();
+    if (!mediaRecorder && fxNodes?.masterNode) setupRecorder(fxNodes.masterNode);
+  } catch (e) {
+    console.error("Audio init/resume failed:", e);
+    return;
+  }
+
+  if (!mediaRecorder) {
+    console.warn("MediaRecorder not ready (unsupported browser or init failed).");
+    return;
+  }
+
+  if (mediaRecorder.state === "recording") {
+    isStopping = true;
+    if (recordBtn) {
+      recordBtn.textContent = "Stopping…";
+      recordBtn.disabled = true;
+      recordBtn.setAttribute("aria-pressed", "false");
+    }
+    try { mediaRecorder.stop(); } catch (e) { isStopping = false; console.error(e); }
+    return;
+  }
+
+  // Start (inactive/paused)
+  hideDownloadLink(); // hide old link if any
+  recordChunks = [];
+  try {
+    mediaRecorder.start(250);
+  } catch (e) {
+    console.error("mediaRecorder.start failed:", e);
+    return;
+  }
+  if (recordBtn) {
+    recordBtn.textContent = "■ Stop";
+    recordBtn.style.color = "rgba(254, 152, 217, 1)";
+    recordBtn.disabled = false;
+    recordBtn.setAttribute("aria-pressed", "true");
+  }
+}
+
+function setupRecorder(masterNode) {
+  if (!audioCtx) return;
+
+  if (!window.MediaRecorder) {
+    console.warn("MediaRecorder not supported in this browser.");
+    if (recordBtn) {
+      recordBtn.disabled = true;
+      recordBtn.title = "MediaRecorder not supported in this browser.";
+    }
+    return;
+  }
+
+  recorderDest = audioCtx.createMediaStreamDestination();
+  try { masterNode.connect(recorderDest); } catch (e) { console.error(e); }
+
+  const mime =
+    MediaRecorder.isTypeSupported("audio/webm;codecs=opus") ? "audio/webm;codecs=opus" :
+    (MediaRecorder.isTypeSupported("audio/webm") ? "audio/webm" : "");
+
+  try {
+    mediaRecorder = new MediaRecorder(recorderDest.stream, mime ? { mimeType: mime } : {});
+  } catch (e) {
+    console.error("MediaRecorder ctor failed:", e);
+    return;
+  }
+
+  mediaRecorder.onstart = () => { recordChunks = []; };
+  mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordChunks.push(e.data); };
+  mediaRecorder.onerror = (e) => { console.error("MediaRecorder error:", e.error || e); };
+
+  mediaRecorder.onstop = () => {
+    isStopping = false;
+    const type = mime || "audio/webm";
+    const blob = new Blob(recordChunks, { type });
+    recordChunks = [];
+    if (blob.size === 0) console.warn("Empty recording blob (no audio frames?).");
+    const url = URL.createObjectURL(blob);
+
+    // Centralized show logic (also revokes previous URL)
+    showDownloadLink(url);
+
+    if (recordBtn) {
+      recordBtn.textContent = "⏺ Record";
+      recordBtn.style.color = "";
+      recordBtn.disabled = false;
+      recordBtn.setAttribute("aria-pressed", "false");
+    }
+  };
+}

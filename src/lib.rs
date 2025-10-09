@@ -99,7 +99,7 @@ impl Synthesizer {
 
             // filter
             "filter_cutoff"    => self.filter.set_cutoff(value.max(20.0)),
-            "filter_resonance" => self.filter.resonance = value.max(0.0),
+            "filter_resonance" => { self.filter.resonance = value.max(0.0); self.filter.update_coeffs(); }
             "filter_env"       => self.filter_env_enabled = value > 0.5,
 
             // LFOs
@@ -204,7 +204,7 @@ impl Synthesizer {
                 get_into(obj, "env_sustain").map(|v| self.env_defaults.sustain = v.clamp(0.0, 1.0));
                 get_into(obj, "env_release").map(|v| self.env_defaults.release = v.max(0.0001));
                 get_into(obj, "filter_cutoff").map(|v| self.filter.set_cutoff(v.max(20.0)));
-                get_into(obj, "filter_resonance").map(|v| self.filter.resonance = v.max(0.0));
+                get_into(obj, "filter_resonance").map(|v| { self.filter.resonance = v.max(0.0); self.filter.update_coeffs(); });
 
                 // wavetables optional
                 if let Ok(wt) = js_sys::Reflect::get(obj, &"wavetables".into()) {
@@ -262,7 +262,8 @@ impl Synthesizer {
             let delayed = self.delay.process(filtered);
             let reverbed = self.reverb.process(delayed);
 
-            out[n] = (reverbed * self.master_gain).clamp(-1.0, 1.0);
+            // gentle soft clip for mix glue / perceived loudness
+            out[n] = soft_clip(reverbed * self.master_gain);
         }
 
         Float32Array::from(out.as_slice())
@@ -393,11 +394,7 @@ impl Voice {
                 Waveform::Sine => ((ph / tl) * 2.0 * PI).sin(),
                 Waveform::Saw => 2.0 * ((ph / tl) - 0.5),
                 Waveform::Square => {
-                    if (ph / tl) < 0.5 {
-                        1.0
-                    } else {
-                        -1.0
-                    }
+                    if (ph / tl) < 0.5 { 1.0 } else { -1.0 }
                 }
                 Waveform::Triangle => {
                     let frac = ph / tl;
@@ -496,12 +493,7 @@ struct LFO {
 }
 impl LFO {
     fn default() -> Self {
-        Self {
-            rate: 2.5,
-            amount: 0.0,
-            phase: 0.0,
-            waveform: 0,
-        }
+        Self { rate: 2.5, amount: 0.0, phase: 0.0, waveform: 0 }
     }
     fn tick(&mut self, dt: f32) {
         self.phase = (self.phase + dt * self.rate * 2.0 * PI) % (2.0 * PI);
@@ -513,13 +505,7 @@ impl LFO {
         let base = match self.waveform {
             0 => self.phase.sin(),
             1 => (2.0 / PI) * self.phase.asin(),
-            2 => {
-                if self.phase.sin() >= 0.0 {
-                    1.0
-                } else {
-                    -1.0
-                }
-            }
+            2 => if self.phase.sin() >= 0.0 { 1.0 } else { -1.0 },
             3 => {
                 let frac = (self.phase / (2.0 * PI)) % 1.0;
                 2.0 * (frac - 0.5)
@@ -558,105 +544,308 @@ impl ModMatrix {
         match name {
             "mod_lfo0_to_cutoff" => self.lfo0_to_cutoff = value,
             "mod_lfo1_to_cutoff" => self.lfo1_to_cutoff = value,
-            "mod_env_to_cutoff" => self.env_to_cutoff = value,
-            "mod_lfo0_to_amp" => self.lfo0_to_amp = value,
-            "mod_lfo1_to_amp" => self.lfo1_to_amp = value,
-            "mod_lfo0_to_wtpos" => self.lfo0_to_wtpos = value,
-            "mod_lfo1_to_wtpos" => self.lfo1_to_wtpos = value,
+            "mod_env_to_cutoff"  => self.env_to_cutoff = value,
+            "mod_lfo0_to_amp"    => self.lfo0_to_amp = value,
+            "mod_lfo1_to_amp"    => self.lfo1_to_amp = value,
+            "mod_lfo0_to_wtpos"  => self.lfo0_to_wtpos = value,
+            "mod_lfo1_to_wtpos"  => self.lfo1_to_wtpos = value,
             _ => {}
         }
     }
 }
 
-// very simple SVF-ish lowpass (stable & cheap)
+// --- Topology-Preserving Transform SVF (lowpass out) -------------------
 struct StateVarFilter {
-    base_cutoff: f32,
-    resonance: f32,
+    pub base_cutoff: f32,
+    pub resonance: f32,   // 0..~1.2; musical mapping to Q
     sample_rate: f32,
-    low: f32,
-    high: f32,
-    band: f32,
+
+    // TPT state
+    g: f32,
+    k: f32,
+    ic1eq: f32,
+    ic2eq: f32,
 }
 impl StateVarFilter {
     fn new(c: f32, q: f32, sr: f32) -> Self {
-        Self {
+        let mut f = Self {
             base_cutoff: c,
             resonance: q,
             sample_rate: sr,
-            low: 0.0,
-            high: 0.0,
-            band: 0.0,
-        }
+            g: 0.0, k: 0.0, ic1eq: 0.0, ic2eq: 0.0,
+        };
+        f.update_coeffs();
+        f
     }
     fn set_cutoff(&mut self, c: f32) {
-        self.base_cutoff = c;
+        self.base_cutoff = c.max(20.0).min(self.sample_rate * 0.49);
+        self.update_coeffs();
     }
+    #[inline]
+    fn update_coeffs(&mut self) {
+        // bilinear transform prewarp with normalized T=1
+        let wc = (std::f32::consts::PI * (self.base_cutoff / self.sample_rate)).tan();
+        self.g = wc;
+
+        // Map resonance (0..1.2) to k = 1/Q; lower "resonance" => higher Q (more peak)
+        let q = 0.5 + (1.5 * (1.0 - self.resonance.clamp(0.0, 1.2))).max(0.05);
+        self.k = 1.0 / q;
+    }
+    #[inline]
     fn process(&mut self, x: f32) -> f32 {
-        let f = (2.0 * (PI * self.base_cutoff / self.sample_rate).sin()).clamp(0.0, 1.0);
-        self.low += f * self.band;
-        self.high = x - self.low - self.resonance * self.band;
-        self.band += f * self.high;
-        self.low
+        // TPT 2-pole lowpass
+        let v0 = x;
+        let v1 = (self.ic1eq + self.g * (v0 - self.ic2eq)) / (1.0 + self.g * (self.g + self.k));
+        let v2 = self.ic2eq + self.g * v1;
+
+        self.ic1eq = 2.0 * v1 - self.ic1eq;
+        self.ic2eq = 2.0 * v2 - self.ic2eq;
+
+        v2
     }
 }
 
+// --- Feedback delay with fractional read + damping ---------------------
 struct SimpleDelay {
     sample_rate: f32,
     buffer: Vec<f32>,
     write_pos: usize,
     length: usize,
     time_seconds: f32,
-    feedback: f32,
-    wet: f32,
+    pub feedback: f32,
+    pub wet: f32,
+
+    // feedback path lowpass (warmer repeats)
+    fb_lp_state: f32,
+    fb_lp_coef: f32,
 }
 impl SimpleDelay {
     fn new(sr: f32, time: f32, fb: f32) -> Self {
         let length = (sr * 5.0) as usize;
-        Self {
+        let mut d = Self {
             sample_rate: sr,
             buffer: vec![0.0; length.max(1)],
             write_pos: 0,
             length: length.max(1),
-            time_seconds: time,
-            feedback: fb,
+            time_seconds: time.clamp(0.0, 5.0),
+            feedback: fb.clamp(0.0, 0.99),
             wet: 0.35,
-        }
+            fb_lp_state: 0.0,
+            fb_lp_coef: 0.0,
+        };
+        d.set_feedback_tone(6000.0);
+        d
     }
     fn set_time(&mut self, t: f32) {
         self.time_seconds = t.clamp(0.0, 5.0);
     }
+    fn set_feedback_tone(&mut self, hz: f32) {
+        let hz = hz.clamp(500.0, 12000.0);
+        let x = (-2.0 * std::f32::consts::PI * hz / self.sample_rate).exp();
+        self.fb_lp_coef = 1.0 - x;
+    }
+    #[inline]
+    fn read_frac(&self, delay_samples: f32) -> f32 {
+        let mut rp = self.write_pos as i32 - delay_samples as i32;
+        while rp < 0 { rp += self.length as i32; }
+        let rp0 = rp as usize % self.length;
+        let rp1 = (rp0 + 1) % self.length;
+        let frac = delay_samples.fract();
+        let a = self.buffer[rp0];
+        let b = self.buffer[rp1];
+        a + (b - a) * frac
+    }
     fn process(&mut self, x: f32) -> f32 {
-        let d = (self.time_seconds * self.sample_rate) as usize % self.length;
-        let read = (self.write_pos + self.length - d) % self.length;
-        let delayed = self.buffer[read];
-        self.buffer[self.write_pos] = x + delayed * self.feedback;
+        let d_samp = (self.time_seconds * self.sample_rate).clamp(0.0, (self.length - 2) as f32);
+
+        // read delayed signal
+        let delayed = self.read_frac(d_samp);
+
+        // feedback path damping (darkens repeats)
+        self.fb_lp_state += self.fb_lp_coef * (delayed - self.fb_lp_state);
+        let fb_sig = self.fb_lp_state * self.feedback;
+
+        // write input + feedback
+        self.buffer[self.write_pos] = x + fb_sig;
         self.write_pos = (self.write_pos + 1) % self.length;
+
+        // wet/dry
         x * (1.0 - self.wet) + delayed * self.wet
     }
 }
 
+// --- Lush Schroeder/Moorer Reverb (mono) -------------------------------
 struct SimpleReverb {
-    comb_buf: Vec<f32>,
-    comb_pos: usize,
-    comb_len: usize,
-    wet: f32,
+    // pre-delay
+    pre_buf: Vec<f32>,
+    pre_pos: usize,
+    pre_len: usize,
+
+    // 4 damped combs
+    comb_bufs: [Vec<f32>; 4],
+    comb_pos: [usize; 4],
+    comb_len: [usize; 4],
+    comb_feedback: [f32; 4],
+    comb_lp_state: [f32; 4],
+    comb_lp_coef: [f32; 4], // feedback damping
+
+    // 2 series allpasses
+    ap_bufs: [Vec<f32>; 2],
+    ap_pos: [usize; 2],
+    ap_len: [usize; 2],
+    ap_g: [f32; 2],
+
+    pub wet: f32,
+    sample_rate: f32,
+    decay: f32, // seconds
+    size: f32,  // scale
 }
 impl SimpleReverb {
     fn new(sr: f32) -> Self {
-        let l = (sr * 0.05) as usize;
-        Self {
-            comb_buf: vec![0.0; l.max(1)],
-            comb_pos: 0,
-            comb_len: l.max(1),
-            wet: 0.25,
+        let mut r = Self {
+            pre_buf: vec![0.0; (0.02 * sr) as usize],
+            pre_pos: 0,
+            pre_len: (0.02 * sr) as usize,
+
+            comb_bufs: [
+                vec![0.0; (0.050 * sr) as usize],
+                vec![0.0; (0.056 * sr) as usize],
+                vec![0.0; (0.061 * sr) as usize],
+                vec![0.0; (0.068 * sr) as usize],
+            ],
+            comb_pos: [0, 0, 0, 0],
+            comb_len: [
+                (0.050 * sr) as usize,
+                (0.056 * sr) as usize,
+                (0.061 * sr) as usize,
+                (0.068 * sr) as usize,
+            ],
+            comb_feedback: [0.77, 0.80, 0.82, 0.84],
+            comb_lp_state: [0.0; 4],
+            comb_lp_coef: [
+                Self::lp_coef(sr, 5000.0),
+                Self::lp_coef(sr, 4500.0),
+                Self::lp_coef(sr, 4000.0),
+                Self::lp_coef(sr, 3500.0),
+            ],
+
+            ap_bufs: [
+                vec![0.0; (0.012 * sr) as usize],
+                vec![0.0; (0.004 * sr) as usize],
+            ],
+            ap_pos: [0, 0],
+            ap_len: [(0.012 * sr) as usize, (0.004 * sr) as usize],
+            ap_g: [0.7, 0.7],
+
+            wet: 0.35,
+            sample_rate: sr,
+            decay: 2.2,
+            size: 1.0,
+        };
+        r.recalc_lengths();
+        r
+    }
+
+    #[inline]
+    fn lp_coef(sr: f32, fc: f32) -> f32 {
+        let x = (-2.0 * std::f32::consts::PI * fc / sr).exp();
+        1.0 - x
+    }
+
+    fn set_size(&mut self, s: f32) {
+        self.size = s.clamp(0.5, 1.5);
+        self.recalc_lengths();
+    }
+
+    fn set_decay(&mut self, seconds: f32) {
+        self.decay = seconds.clamp(0.2, 8.0);
+        for i in 0..4 {
+            let len_s = (self.comb_len[i] as f32) / self.sample_rate;
+            // T60 ≈ -3 * len / ln(feedback)  => feedback ≈ e^( -3*len / T60 )
+            let fb = (-3.0 * len_s / self.decay).exp();
+            self.comb_feedback[i] = fb.clamp(0.5, 0.98);
         }
     }
+
+    fn recalc_lengths(&mut self) {
+        let scale = self.size;
+        let scale_len = |l: usize| ((l as f32) * scale).max(1.0) as usize;
+
+        self.pre_len = scale_len((0.02 * self.sample_rate) as usize);
+        self.pre_buf.resize(self.pre_len.max(1), 0.0);
+        self.pre_pos %= self.pre_len.max(1);
+
+        let base = [
+            (0.050 * self.sample_rate) as usize,
+            (0.056 * self.sample_rate) as usize,
+            (0.061 * self.sample_rate) as usize,
+            (0.068 * self.sample_rate) as usize,
+        ];
+        for i in 0..4 {
+            let nl = scale_len(base[i]);
+            self.comb_len[i] = nl.max(1);
+            self.comb_bufs[i].resize(self.comb_len[i], 0.0);
+            self.comb_pos[i] %= self.comb_len[i];
+        }
+
+        let ap_base = [
+            (0.012 * self.sample_rate) as usize,
+            (0.004 * self.sample_rate) as usize,
+        ];
+        for i in 0..2 {
+            let nl = scale_len(ap_base[i]);
+            self.ap_len[i] = nl.max(1);
+            self.ap_bufs[i].resize(self.ap_len[i], 0.0);
+            self.ap_pos[i] %= self.ap_len[i];
+        }
+
+        self.set_decay(self.decay);
+    }
+
+    #[inline]
+    fn comb_process(&mut self, i: usize, x: f32) -> f32 {
+        let p = self.comb_pos[i];
+        let y = self.comb_bufs[i][p];
+
+        // damping in feedback loop
+        let a = self.comb_lp_coef[i];
+        self.comb_lp_state[i] += a * (y - self.comb_lp_state[i]);
+        let fb = self.comb_feedback[i];
+
+        self.comb_bufs[i][p] = x + self.comb_lp_state[i] * fb;
+        self.comb_pos[i] = (p + 1) % self.comb_len[i];
+        y
+    }
+
+    #[inline]
+    fn allpass_process(&mut self, i: usize, x: f32) -> f32 {
+        let p = self.ap_pos[i];
+        let buf = self.ap_bufs[i][p];
+        let g = self.ap_g[i];
+
+        let y = -x + buf;
+        self.ap_bufs[i][p] = x + buf * g;
+
+        self.ap_pos[i] = (p + 1) % self.ap_len[i];
+        y
+    }
+
     fn process(&mut self, x: f32) -> f32 {
-        let c = self.comb_buf[self.comb_pos];
-        let out = x + c * 0.3;
-        self.comb_buf[self.comb_pos] = out;
-        self.comb_pos = (self.comb_pos + 1) % self.comb_len;
-        x * (1.0 - self.wet) + out * self.wet
+        // pre-delay
+        let y0 = self.pre_buf[self.pre_pos];
+        self.pre_buf[self.pre_pos] = x;
+        self.pre_pos = (self.pre_pos + 1) % self.pre_len;
+
+        // parallel combs → average
+        let mut s = 0.0;
+        for i in 0..4 { s += self.comb_process(i, y0); }
+        s *= 0.25;
+
+        // diffusion allpasses
+        let y1 = self.allpass_process(0, s);
+        let y2 = self.allpass_process(1, y1);
+
+        x * (1.0 - self.wet) + y2 * self.wet
     }
 }
 
@@ -679,6 +868,15 @@ fn get_into(obj: &Object, key: &str) -> Option<f32> {
         .ok()
         .and_then(|v| v.as_f64())
         .map(|x| x as f32)
+}
+
+// gentle, musical soft saturation
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    // smooth, monotonic; keeps transients while taming peaks
+    let a = 0.5;
+    let x1 = x.clamp(-2.0, 2.0);
+    x1 * (1.0 + a) / (1.0 + a * x1.abs())
 }
 
 // better panic messages in console
