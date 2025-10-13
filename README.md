@@ -1,7 +1,7 @@
 #  Aeon Keys - Serum-Like Web Synth (Rust + WebAssembly + Web Audio API)
 
-A browser-based **software synthesizer** inspired by Xfer Serum, built using **Rust (compiled to WebAssembly)** and the **Web Audio API**.  
-It provides a **modern synth UI** with **oscillators, filters, envelopes, LFOs, effects, modulation matrix, wavetable editor, presets, MIDI input, and spectrum analyzers** — all running **directly in your browser**.
+A browser-based **Software Synthesizer** Inspired by Xfer Serum, Built using **Rust (Compiled to WebAssembly)** and the **Web Audio API**. 
+It Provides a **Modern Synth UI** with **Oscillators, Filters, Envelopes, LFOs, Effects, Modulation Matrix, Wavetable Editor, Presets, MIDI Input, and Spectrum Analyzers** — All Running **Directly in Your Browser**.
 
 <img width="637" height="1006" alt="Screenshot 2025-10-09 at 2 56 29 PM" src="https://github.com/user-attachments/assets/2c267efa-891a-4479-a0eb-4b334a9c8e39" />
 
